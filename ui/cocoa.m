@@ -378,6 +378,10 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         [self setClipsToBounds:YES];
 #endif
         [self setWantsLayer:YES];
+        /* Use CALayer-based rendering instead of drawRect: for flicker-free
+         * GPU-composited scaling when zoom-to-fit is enabled. */
+        [[self layer] setContentsGravity:kCAGravityResizeAspect];
+        [[self layer] setBackgroundColor:CGColorGetConstantColor(kCGColorBlack)];
         cursorLayer = [[CALayer alloc] init];
         [cursorLayer setAnchorPoint:CGPointMake(0, 1)];
         [cursorLayer setAutoresizingMask:kCALayerMaxXMargin |
@@ -409,6 +413,58 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (BOOL) isOpaque
 {
     return YES;
+}
+
+- (BOOL) wantsUpdateLayer
+{
+    return YES;
+}
+
+- (void) updateLayer
+{
+    if (!pixman_image) {
+        [self.layer setContents:nil];
+        return;
+    }
+
+    int w = pixman_image_get_width(pixman_image);
+    int h = pixman_image_get_height(pixman_image);
+    int bitsPerPixel = PIXMAN_FORMAT_BPP(pixman_image_get_format(pixman_image));
+    int stride = pixman_image_get_stride(pixman_image);
+    CGDataProviderRef dataProviderRef = CGDataProviderCreateWithData(
+        NULL,
+        pixman_image_get_data(pixman_image),
+        stride * h,
+        NULL
+    );
+    CGImageRef imageRef = CGImageCreate(
+        w,
+        h,
+        DIV_ROUND_UP(bitsPerPixel, 8) * 2,
+        bitsPerPixel,
+        stride,
+        colorspace,
+        kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+        dataProviderRef,
+        NULL,
+        0,
+        kCGRenderingIntentDefault
+    );
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [self.layer setContents:(id)imageRef];
+    if (zoom_interpolation == kCGInterpolationNone) {
+        [self.layer setMagnificationFilter:kCAFilterNearest];
+        [self.layer setMinificationFilter:kCAFilterNearest];
+    } else {
+        [self.layer setMagnificationFilter:kCAFilterLinear];
+        [self.layer setMinificationFilter:kCAFilterLinear];
+    }
+    [CATransaction commit];
+
+    CGImageRelease(imageRef);
+    CGDataProviderRelease(dataProviderRef);
 }
 
 - (void) viewDidMoveToWindow
@@ -636,7 +692,18 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         [[self window] setContentSize:[self fixAspectRatio:[self screenSafeAreaSize]]];
         [[self window] center];
     } else {
-        [[self window] setContentSize:[self fixAspectRatio:[self frame].size]];
+        NSSize currentSize = [self frame].size;
+        /* If the window is smaller than the guest resolution (e.g. initial
+         * 640x480 frame), scale up to fill ~75% of the screen. This gives
+         * a good initial size when zoom-to-fit is enabled. */
+        if (currentSize.width < screen.width || currentSize.height < screen.height) {
+            NSSize safeArea = [self screenSafeAreaSize];
+            NSSize target = NSMakeSize(safeArea.width * 0.75, safeArea.height * 0.75);
+            [[self window] setContentSize:[self fixAspectRatio:target]];
+            [[self window] center];
+        } else {
+            [[self window] setContentSize:[self fixAspectRatio:currentSize]];
+        }
     }
 }
 
@@ -688,8 +755,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
     info.xoff = 0;
     info.yoff = 0;
-    info.width = frameSize.width * [[self window] backingScaleFactor];
-    info.height = frameSize.height * [[self window] backingScaleFactor];
+    // Report logical (point) size, not backing (pixel) size.
+    // This prevents Retina displays from telling the guest to render at 2x,
+    // which would result in a tiny UI at native 4K+ resolution.
+    info.width = frameSize.width;
+    info.height = frameSize.height;
 
     dpy_set_ui_info(dcl.con, &info, TRUE);
 }
@@ -1185,9 +1255,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     COCOA_DEBUG("QemuCocoaView: grabMouse\n");
 
     if (qemu_name)
-        [[self window] setTitle:[NSString stringWithFormat:@"QEMU %s - (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)", qemu_name]];
+        [[self window] setTitle:[NSString stringWithFormat:@"MacVirt — %s (" UC_CTRL_KEY UC_ALT_KEY "G to release mouse)", qemu_name]];
     else
-        [[self window] setTitle:@"QEMU - (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)"];
+        [[self window] setTitle:@"MacVirt (" UC_CTRL_KEY UC_ALT_KEY "G to release mouse)"];
     [self hideCursor];
     CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
     isMouseGrabbed = TRUE; // while isMouseGrabbed = TRUE, QemuCocoaApp sends all events to [cocoaView handleEvent:]
@@ -1198,9 +1268,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     COCOA_DEBUG("QemuCocoaView: ungrabMouse\n");
 
     if (qemu_name)
-        [[self window] setTitle:[NSString stringWithFormat:@"QEMU %s", qemu_name]];
+        [[self window] setTitle:[NSString stringWithFormat:@"MacVirt — %s", qemu_name]];
     else
-        [[self window] setTitle:@"QEMU"];
+        [[self window] setTitle:@"MacVirt"];
     [self unhideCursor];
     CGAssociateMouseAndMouseCursorPosition(TRUE);
     isMouseGrabbed = FALSE;
@@ -1307,7 +1377,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         }
         [window setAcceptsMouseMovedEvents:YES];
         [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
-        [window setTitle:qemu_name ? [NSString stringWithFormat:@"QEMU %s", qemu_name] : @"QEMU"];
+        [window setTitle:qemu_name ? [NSString stringWithFormat:@"MacVirt — %s", qemu_name] : @"MacVirt"];
         [window setContentView:cocoaView];
         [window makeKeyAndOrderFront:self];
         [window center];
@@ -1653,7 +1723,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     NSString *icon_path = [NSString stringWithUTF8String:icon_path_c];
     g_free(icon_path_c);
     NSImage *icon = [[NSImage alloc] initWithContentsOfFile:icon_path];
-    NSString *version = @"QEMU emulator version " QEMU_FULL_VERSION;
+    NSString *version = @"MacVirt (QEMU " QEMU_FULL_VERSION ")";
     NSString *copyright = @QEMU_COPYRIGHT;
     NSDictionary *options;
     if (icon) {
@@ -1729,17 +1799,17 @@ static void create_initial_menus(void)
 
     // Application menu
     menu = [[NSMenu alloc] initWithTitle:@""];
-    [menu addItemWithTitle:@"About QEMU" action:@selector(do_about_menu_item:) keyEquivalent:@""]; // About QEMU
+    [menu addItemWithTitle:@"About MacVirt" action:@selector(do_about_menu_item:) keyEquivalent:@""]; // About MacVirt
     [menu addItem:[NSMenuItem separatorItem]]; //Separator
     menuItem = [menu addItemWithTitle:@"Services" action:nil keyEquivalent:@""];
     [menuItem setSubmenu:[NSApp servicesMenu]];
     [menu addItem:[NSMenuItem separatorItem]];
-    [menu addItemWithTitle:@"Hide QEMU" action:@selector(hide:) keyEquivalent:@"h"]; //Hide QEMU
+    [menu addItemWithTitle:@"Hide MacVirt" action:@selector(hide:) keyEquivalent:@"h"]; //Hide MacVirt
     menuItem = (NSMenuItem *)[menu addItemWithTitle:@"Hide Others" action:@selector(hideOtherApplications:) keyEquivalent:@"h"]; // Hide Others
     [menuItem setKeyEquivalentModifierMask:(NSEventModifierFlagOption|NSEventModifierFlagCommand)];
     [menu addItemWithTitle:@"Show All" action:@selector(unhideAllApplications:) keyEquivalent:@""]; // Show All
     [menu addItem:[NSMenuItem separatorItem]]; //Separator
-    [menu addItemWithTitle:@"Quit QEMU" action:@selector(terminate:) keyEquivalent:@"q"];
+    [menu addItemWithTitle:@"Quit MacVirt" action:@selector(terminate:) keyEquivalent:@"q"];
     menuItem = [[NSMenuItem alloc] initWithTitle:@"Apple" action:nil keyEquivalent:@""];
     [menuItem setSubmenu:menu];
     [[NSApp mainMenu] addItem:menuItem];
@@ -2031,8 +2101,7 @@ static void cocoa_update(DisplayChangeListener *dcl,
     COCOA_DEBUG("qemu_cocoa: cocoa_update\n");
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSRect rect = NSMakeRect(x, [cocoaView gscreen].height - y - h, w, h);
-        [cocoaView setNeedsDisplayInRect:rect];
+        [cocoaView setNeedsDisplay:YES];
     });
 }
 

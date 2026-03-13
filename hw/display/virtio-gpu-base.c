@@ -59,11 +59,19 @@ virtio_gpu_base_generate_edid(VirtIOGPUBase *g, int scanout,
 {
     size_t output_idx;
     VirtIOGPUOutputList *node;
+    /* Use configured xres/yres as the preferred and max resolution.
+     * This prevents the guest from auto-selecting a resolution based on
+     * the dynamic window size (which may be small at boot or scaled on
+     * Retina displays). */
+    uint32_t prefx = MAX(g->req_state[scanout].width, g->conf.xres);
+    uint32_t prefy = MAX(g->req_state[scanout].height, g->conf.yres);
     qemu_edid_info info = {
         .width_mm = g->req_state[scanout].width_mm,
         .height_mm = g->req_state[scanout].height_mm,
-        .prefx = g->req_state[scanout].width,
-        .prefy = g->req_state[scanout].height,
+        .prefx = prefx,
+        .prefy = prefy,
+        .maxx = prefx,
+        .maxy = prefy,
         .refresh_rate = g->req_state[scanout].refresh_rate,
     };
 
