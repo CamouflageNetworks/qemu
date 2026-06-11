@@ -1,6 +1,6 @@
 # MacVirt — Modified QEMU
 
-[Camouflage](https://camouflage.network) uses **camouflage-vmkit** (Apple Virtualization.framework) for Linux virtual machines and **QEMU** for Windows virtual machines. Both are packaged inside the **MacVirt.app** bundle.
+[Camouflage](https://camouflage.network) uses **camouflage-macvirt** (Apple Virtualization.framework) for Linux virtual machines and **QEMU** for Windows virtual machines. Both are packaged inside the **MacVirt.app** bundle.
 
 This is a fork of [QEMU](https://www.qemu.org/) modified by Camouflage Networks, Inc. for use in the MacVirt virtual machine manager.
 
