@@ -26,6 +26,9 @@
 #include "tcg/helper-tcg.h"
 #include "exec/translation-block.h"
 #include "system/hvf.h"
+#include "system/mshv.h"
+#include "system/whpx.h"
+#include "whpx/whpx-i386.h"
 #include "hvf/hvf-i386.h"
 #include "kvm/kvm_i386.h"
 #include "kvm/tdx.h"
@@ -39,6 +42,7 @@
 #include "exec/watchpoint.h"
 #ifndef CONFIG_USER_ONLY
 #include "confidential-guest.h"
+#include "monitor/hmp.h"
 #include "system/reset.h"
 #include "qapi/qapi-commands-machine.h"
 #include "system/address-spaces.h"
@@ -1170,7 +1174,7 @@ FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
             "tsc-scale", "vmcb-clean",  "flushbyasid", "decodeassists",
             NULL, NULL, "pause-filter", NULL,
             "pfthreshold", "avic", NULL, "v-vmsave-vmload",
-            "vgif", NULL, NULL, NULL,
+            "vgif", "gmet", NULL, NULL,
             NULL, NULL, NULL, NULL,
             NULL, "vnmi", NULL, NULL,
             "svme-addr-chk", NULL, NULL, NULL,
@@ -4767,6 +4771,14 @@ static const X86CPUDefinition builtin_x86_defs[] = {
                     { /* end of list */ }
                 }
             },
+            {
+                .version = 6,
+                .note = "with MBEC enabled",
+                .props = (PropValue[]) {
+                    { "vmx-mbec", "on" },
+                    { /* end of list */ }
+                }
+            },
             { /* end of list */ }
         }
     },
@@ -4898,6 +4910,24 @@ static const X86CPUDefinition builtin_x86_defs[] = {
               .props = (PropValue[]) {
                   { "xsaves", "on" },
                   { "vmx-xsaves", "on" },
+                  { /* end of list */ }
+              },
+            },
+            { .version = 6,
+              .note = "with MMIO/GDS/RFDS mitigation status",
+              .props = (PropValue[]) {
+                  { "fb-clear", "on" },
+                  { "gds-no", "on" },
+                  { "psdp-no", "on" },
+                  { "rfds-no", "on" },
+                  { "sbdr-ssdp-no", "on" },
+                  { /* end of list */ }
+              },
+            },
+            { .version = 7,
+              .note = "with MBEC enabled",
+              .props = (PropValue[]) {
+                  { "vmx-mbec", "on" },
                   { /* end of list */ }
               },
             },
@@ -5183,6 +5213,26 @@ static const X86CPUDefinition builtin_x86_defs[] = {
                     { /* end of list */ }
                 },
             },
+            {
+                .version = 8,
+                .note = "with MMIO/GDS/RFDS mitigation status",
+                .props = (PropValue[]) {
+                    { "fb-clear", "on" },
+                    { "gds-no", "on" },
+                    { "psdp-no", "on" },
+                    { "rfds-no", "on" },
+                    { "sbdr-ssdp-no", "on" },
+                    { /* end of list */ }
+                },
+            },
+            {
+                .version = 9,
+                .note = "with MBEC enabled",
+                .props = (PropValue[]) {
+                    { "vmx-mbec", "on" },
+                    { /* end of list */ }
+                }
+            },
             { /* end of list */ }
         }
     },
@@ -5357,6 +5407,23 @@ static const X86CPUDefinition builtin_x86_defs[] = {
                 .note = "with its-no",
                 .props = (PropValue[]) {
                     { "its-no", "on" },
+                    { /* end of list */ },
+                }
+            },
+            {
+                .version = 7,
+                .note = "with GDS and RFDS mitigation status",
+                .props = (PropValue[]) {
+                    { "gds-no", "on" },
+                    { "rfds-no", "on" },
+                    { /* end of list */ },
+                }
+            },
+            {
+                .version = 8,
+                .note = "with MBEC enabled",
+                .props = (PropValue[]) {
+                    { "vmx-mbec", "on" },
                     { /* end of list */ },
                 }
             },
@@ -5538,6 +5605,23 @@ static const X86CPUDefinition builtin_x86_defs[] = {
                 .note = "with its-no",
                 .props = (PropValue[]) {
                     { "its-no", "on" },
+                    { /* end of list */ },
+                }
+            },
+            {
+                .version = 6,
+                .note = "with GDS and RFDS mitigation status",
+                .props = (PropValue[]) {
+                    { "gds-no", "on" },
+                    { "rfds-no", "on" },
+                    { /* end of list */ },
+                }
+            },
+            {
+                .version = 7,
+                .note = "with MBEC enabled",
+                .props = (PropValue[]) {
+                    { "vmx-mbec", "on" },
                     { /* end of list */ },
                 }
             },
@@ -5735,6 +5819,18 @@ static const X86CPUDefinition builtin_x86_defs[] = {
         .features[FEAT_VMX_VMFUNC] = MSR_VMX_VMFUNC_EPT_SWITCHING,
         .xlevel = 0x80000008,
         .model_id = "Intel Xeon Processor (DiamondRapids)",
+        .versions = (X86CPUVersionDefinition[]) {
+            { .version = 1 },
+            {
+                .version = 2,
+                .note = "with MBEC enabled",
+                .props = (PropValue[]) {
+                    { "vmx-mbec", "on" },
+                    { /* end of list */ },
+                }
+            },
+            { /* end of list */ },
+        },
     },
     {
         .name = "SierraForest",
@@ -5906,6 +6002,14 @@ static const X86CPUDefinition builtin_x86_defs[] = {
                     { /* end of list */ },
                 }
             },
+            {
+                .version = 6,
+                .note = "with MBEC enabled",
+                .props = (PropValue[]) {
+                    { "vmx-mbec", "on" },
+                    { /* end of list */ },
+                }
+            },
             { /* end of list */ },
         },
     },
@@ -6059,6 +6163,14 @@ static const X86CPUDefinition builtin_x86_defs[] = {
                 .props = (PropValue[]) {
                     { "its-no", "on" },
                     { "x-force-cpuid-0x1f", "on" },
+                    { /* end of list */ },
+                }
+            },
+            {
+                .version = 4,
+                .note = "with MBEC enabled",
+                .props = (PropValue[]) {
+                    { "vmx-mbec", "on" },
                     { /* end of list */ },
                 }
             },
@@ -6836,6 +6948,16 @@ static const X86CPUDefinition builtin_x86_defs[] = {
                 },
                 .cache_info = &epyc_milan_v3_cache_info
             },
+            {
+                .version = 4,
+                .props = (PropValue[]) {
+                    { "gmet", "on" },
+                    { "model-id",
+                      "AMD EPYC-Milan-v4 Processor" },
+                    { /* end of list */ }
+                },
+                .cache_info = &epyc_milan_v3_cache_info
+            },
             { /* end of list */ }
         }
     },
@@ -6929,6 +7051,16 @@ static const X86CPUDefinition builtin_x86_defs[] = {
                     { "perfmon-v2", "on" },
                     { "model-id",
                       "AMD EPYC-Genoa-v2 Processor" },
+                    { /* end of list */ }
+                },
+                .cache_info = &epyc_genoa_v2_cache_info
+            },
+            {
+                .version = 3,
+                .props = (PropValue[]) {
+                    { "gmet", "on" },
+                    { "model-id",
+                      "AMD EPYC-Genoa-v3 Processor" },
                     { /* end of list */ }
                 },
                 .cache_info = &epyc_genoa_v2_cache_info
@@ -7163,6 +7295,20 @@ static const X86CPUDefinition builtin_x86_defs[] = {
         .xlevel = 0x80000022,
         .model_id = "AMD EPYC-Turin Processor",
         .cache_info = &epyc_turin_cache_info,
+        .versions = (X86CPUVersionDefinition[]) {
+            { .version = 1 },
+            {
+                .version = 2,
+                .props = (PropValue[]) {
+                    { "gmet", "on" },
+                    { "model-id",
+                      "AMD EPYC-Turin-v2 Processor" },
+                    { /* end of list */ }
+                },
+                .cache_info = &epyc_turin_cache_info
+            },
+            { /* end of list */ }
+        }
     },
 };
 
@@ -7842,6 +7988,7 @@ static void x86_cpu_get_unavailable_features(Object *obj, Visitor *v,
 
     x86_cpu_list_feature_names(xc->filtered_features, &result);
     visit_type_strList(v, "unavailable-features", &result, errp);
+    qapi_free_strList(result);
 }
 
 /* Print all cpuid feature names in featureset
@@ -8087,7 +8234,24 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w)
         r = hvf_get_supported_cpuid(wi->cpuid.eax,
                                     wi->cpuid.ecx,
                                     wi->cpuid.reg);
-    } else if (tcg_enabled()) {
+    } else if (mshv_enabled()) {
+        if (wi->type != CPUID_FEATURE_WORD) {
+            return 0;
+        }
+        r = mshv_get_supported_cpuid(wi->cpuid.eax,
+                                     wi->cpuid.ecx,
+                                     wi->cpuid.reg);
+    } else if (whpx_enabled()) {
+        switch (wi->type) {
+        case CPUID_FEATURE_WORD:
+            r = whpx_get_supported_cpuid(wi->cpuid.eax, wi->cpuid.ecx,
+                                                            wi->cpuid.reg);
+            break;
+        case MSR_FEATURE_WORD:
+            r = whpx_get_supported_msr_feature(wi->msr.index);
+            break;
+        }
+    } else if (tcg_enabled() || qtest_enabled()) {
         r = wi->tcg_features;
     } else {
         return ~0;
@@ -8168,6 +8332,11 @@ static void x86_cpu_get_supported_cpuid(uint32_t func, uint32_t index,
         *ebx = hvf_get_supported_cpuid(func, index, R_EBX);
         *ecx = hvf_get_supported_cpuid(func, index, R_ECX);
         *edx = hvf_get_supported_cpuid(func, index, R_EDX);
+    } else if (whpx_enabled()) {
+        *eax = whpx_get_supported_cpuid(func, index, R_EAX);
+        *ebx = whpx_get_supported_cpuid(func, index, R_EBX);
+        *ecx = whpx_get_supported_cpuid(func, index, R_ECX);
+        *edx = whpx_get_supported_cpuid(func, index, R_EDX);
     } else {
         *eax = 0;
         *ebx = 0;
@@ -9628,9 +9797,9 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
     if ((env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_MPX) &&
         (env->features[FEAT_7_1_EDX] & CPUID_7_1_EDX_APXF)) {
         mark_unavailable_features(cpu, FEAT_7_0_EBX, CPUID_7_0_EBX_MPX,
-            "this feature is conflict with APX");
+            "this feature conflicts with APX");
         mark_unavailable_features(cpu, FEAT_7_1_EDX, CPUID_7_1_EDX_APXF,
-            "this feature is conflict with MPX");
+            "this feature conflicts with MPX");
     }
 
     x86_cpu_enable_xsave_components(cpu);
@@ -9995,7 +10164,7 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
      * These may be set by the accel-specific code,
      * and the results are subsequently checked / assumed in this function.
      */
-    cpu_exec_realizefn(cs, &local_err);
+    cpu_common_realize(cs, &local_err);
     if (local_err != NULL) {
         error_propagate(errp, local_err);
         return;
@@ -10010,7 +10179,7 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
     if (cpu->guest_phys_bits == -1) {
         /*
          * If it was not set by the user, or by the accelerator via
-         * cpu_exec_realizefn, clear.
+         * cpu_common_realize, clear.
          */
         cpu->guest_phys_bits = 0;
     }
@@ -10019,7 +10188,7 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
         /*
          * The default is the same as KVM's. Note that this check
          * needs to happen after the evenual setting of ucode_rev in
-         * accel-specific code in cpu_exec_realizefn.
+         * accel-specific code in cpu_common_realize.
          */
         if (IS_AMD_CPU(env)) {
             cpu->ucode_rev = 0x01000065;
@@ -10032,7 +10201,7 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
      * mwait extended info: needed for Core compatibility
      * We always wake on interrupt even if host does not have the capability.
      *
-     * requires the accel-specific code in cpu_exec_realizefn to
+     * requires the accel-specific code in cpu_common_realize to
      * have already acquired the CPUID data into cpu->mwait.
      */
     cpu->mwait.ecx |= CPUID_MWAIT_EMX | CPUID_MWAIT_IBE;
@@ -10061,7 +10230,7 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
      * Note that this code assumes features expansion has already been done
      * (as it checks for CPUID_EXT2_LM), and also assumes that potential
      * phys_bits adjustments to match the host have been already done in
-     * accel-specific code in cpu_exec_realizefn.
+     * accel-specific code in cpu_common_realize.
      */
     if (env->features[FEAT_8000_0001_EDX] & CPUID_EXT2_LM) {
         if (cpu->phys_bits && cpu->phys_bits < 32) {
@@ -10107,10 +10276,11 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
 
     /* Cache information initialization */
     if (!cpu->legacy_cache) {
-        const CPUCaches *cache_info =
-            x86_cpu_get_versioned_cache_info(cpu, xcc->model);
+        const CPUCaches *cache_info = xcc->model
+            ? x86_cpu_get_versioned_cache_info(cpu, xcc->model)
+            : NULL;
 
-        if (!xcc->model || !cache_info) {
+        if (!cache_info) {
             g_autofree char *name = x86_cpu_class_get_model_name(xcc);
             error_setg(errp,
                        "CPU model '%s' doesn't support legacy-cache=off", name);
@@ -10217,7 +10387,7 @@ static void x86_cpu_set_bit_prop(Object *obj, Visitor *v, const char *name,
     BitProperty *fp = opaque;
     bool value;
 
-    if (dev->realized) {
+    if (qdev_is_realized(dev)) {
         qdev_prop_set_after_realize(dev, name, errp);
         return;
     }
@@ -10456,14 +10626,12 @@ int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request)
                    (((env->hflags2 & HF2_VINTR_MASK) &&
                      (env->hflags2 & HF2_HIF_MASK)) ||
                     (!(env->hflags2 & HF2_VINTR_MASK) &&
-                     (env->eflags & IF_MASK &&
-                      !(env->hflags & HF_INHIBIT_IRQ_MASK))))) {
+                     x86_cpu_interrupts_enabled(env)))) {
             return CPU_INTERRUPT_HARD;
         } else if (env->hflags2 & HF2_VGIF_MASK) {
-            if((interrupt_request & CPU_INTERRUPT_VIRQ) &&
-                   (env->eflags & IF_MASK) &&
-                   !(env->hflags & HF_INHIBIT_IRQ_MASK)) {
-                        return CPU_INTERRUPT_VIRQ;
+            if ((interrupt_request & CPU_INTERRUPT_VIRQ) &&
+                x86_cpu_interrupts_enabled(env)) {
+                return CPU_INTERRUPT_VIRQ;
             }
         }
     }
@@ -10684,19 +10852,47 @@ static const Property x86_cpu_properties[] = {
 };
 
 #ifndef CONFIG_USER_ONLY
+
+static int64_t monitor_get_pc(Monitor *mon, const struct MonitorDef *md,
+                              int offset)
+{
+    CPUArchState *env = mon_get_cpu_env(mon);
+    int64_t ret = env->eip + env->segs[R_CS].base;
+
+    if (!(env->hflags & HF_CS64_MASK)) {
+        ret = (int32_t)ret;
+    }
+    return ret;
+}
+
+static const MonitorDef x86_monitor_defs[] = {
+#define SEG(name, seg) \
+    { name ".limit", offsetof(CPUX86State, segs[seg].limit) },
+    SEG("cs", R_CS)
+    SEG("ds", R_DS)
+    SEG("es", R_ES)
+    SEG("ss", R_SS)
+    SEG("fs", R_FS)
+    SEG("gs", R_GS)
+    { "pc", 0, monitor_get_pc, },
+    { NULL },
+#undef SEG
+};
+
 #include "hw/core/sysemu-cpu-ops.h"
 
 static const struct SysemuCPUOps i386_sysemu_ops = {
     .has_work = x86_cpu_has_work,
     .get_memory_mapping = x86_cpu_get_memory_mapping,
     .get_paging_enabled = x86_cpu_get_paging_enabled,
-    .get_phys_page_attrs_debug = x86_cpu_get_phys_page_attrs_debug,
+    .translate_for_debug = x86_cpu_translate_for_debug,
     .asidx_from_attrs = x86_asidx_from_attrs,
     .get_crash_info = x86_cpu_get_crash_info,
     .write_elf32_note = x86_cpu_write_elf32_note,
     .write_elf64_note = x86_cpu_write_elf64_note,
     .write_elf32_qemunote = x86_cpu_write_elf32_qemunote,
     .write_elf64_qemunote = x86_cpu_write_elf64_qemunote,
+    .monitor_defs = x86_monitor_defs,
     .legacy_vmsd = &vmstate_x86_cpu,
 };
 #endif

@@ -7,7 +7,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/datadir.h"
-#include "cpu.h"
+#include "target/hppa/cpu.h"
 #include "elf.h"
 #include "hw/core/loader.h"
 #include "qemu/error-report.h"
@@ -43,14 +43,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(HppaMachineState, HPPA_COMMON_MACHINE)
 
 struct HppaMachineState {
     MachineState parent_obj;
+
+    DeviceState *lasi_dev;
+    uint64_t memsplit_addr;
 };
 
 #define MIN_SEABIOS_HPPA_VERSION 22 /* require at least this fw version */
 
 #define HPA_POWER_BUTTON        (FIRMWARE_END - 0x10)
 static hwaddr soft_power_reg;
-
-static DeviceState *lasi_dev;
 
 static void hppa_powerdown_req(Notifier *n, void *opaque)
 {
@@ -208,6 +209,7 @@ static FWCfgState *create_fw_cfg(MachineState *ms, PCIBus *pci_bus,
     const char qemu_version[] = QEMU_VERSION;
     MachineClass *mc = MACHINE_GET_CLASS(ms);
     int btlb_entries = HPPA_BTLB_ENTRIES(&cpu[0]->env);
+    struct HppaMachineState *hpm = HPPA_COMMON_MACHINE(ms);
     int len;
 
     fw_cfg = fw_cfg_init_mem_nodma(addr, addr + 4, 1);
@@ -230,6 +232,10 @@ static FWCfgState *create_fw_cfg(MachineState *ms, PCIBus *pci_bus,
     len = strlen(mc->name) + 1;
     fw_cfg_add_file(fw_cfg, "/etc/hppa/machine",
                     g_memdup2(mc->name, len), len);
+
+    val = cpu_to_le64(hpm->memsplit_addr);
+    fw_cfg_add_file(fw_cfg, "/etc/hppa/memsplit-addr",
+                    g_memdup2(&val, sizeof(val)), sizeof(val));
 
     val = cpu_to_le64(soft_power_reg);
     fw_cfg_add_file(fw_cfg, "/etc/hppa/power-button-addr",
@@ -287,6 +293,8 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
     TranslateFn *translate;
     MemoryRegion *cpu_region;
     uint64_t ram_max;
+    struct HppaMachineState *hpm;
+    hwaddr splitaddr;
 
     /* Create CPUs.  */
     for (unsigned int i = 0; i < smp_cpus; i++) {
@@ -306,6 +314,8 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
 
     for (unsigned int i = 0; i < smp_cpus; i++) {
         g_autofree char *name = g_strdup_printf("cpu%u-io-eir", i);
+        g_autofree char *cflush_name = NULL;
+        MemoryRegion *cflush;
 
         cpu_region = g_new(MemoryRegion, 1);
         memory_region_init_io(cpu_region, OBJECT(cpu[i]), &hppa_io_eir_ops,
@@ -313,6 +323,24 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
         memory_region_add_subregion(addr_space,
                                     translate(NULL, CPU_HPA + i * 0x1000),
                                     cpu_region);
+
+        if (!hppa_is_pa20(&cpu[0]->env)) {
+            continue;
+        }
+
+        /*
+         * HP-UX 11 64-bit reads a word from address CPU_HPA + 0x500
+         * while flushing the cache of a T600, which was the first
+         * server with a 64-bit PA-RISC 2.0 CPU.
+         * We return 0, since the value isn't used anyway.
+         */
+        cflush_name = g_strdup_printf("cpu%u-T600-cacheflush", i);
+        cflush = g_new(MemoryRegion, 1);
+        memory_region_init_io(cflush, NULL, &hppa_pci_ignore_ops,
+                              NULL, cflush_name, 4);
+        memory_region_add_subregion(addr_space,
+                              translate(NULL, CPU_HPA + i * 0x1000 + 0x500),
+                              cflush);
     }
 
     /* RTC and DebugOutputPort on CPU #0 */
@@ -327,21 +355,36 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
         info_report("Max RAM size limited to %" PRIu64 " MB", ram_max / MiB);
         machine->ram_size = ram_max;
     }
-    if (machine->ram_size <= FIRMWARE_START) {
-        /* contiguous memory up to 3.75 GB RAM */
-        memory_region_add_subregion_overlap(addr_space, 0, machine->ram, -1);
-    } else {
+
+    hpm = HPPA_COMMON_MACHINE(machine);
+    if (!hpm->memsplit_addr) {
         /* non-contiguous: Memory above 3.75 GB is mapped at RAM_MAP_HIGH */
-        MemoryRegion *mem_region;
-        mem_region = g_new(MemoryRegion, 2);
-        memory_region_init_alias(&mem_region[0], &addr_space->parent_obj,
-                              "LowMem", machine->ram, 0, FIRMWARE_START);
-        memory_region_init_alias(&mem_region[1], &addr_space->parent_obj,
-                              "HighMem", machine->ram, FIRMWARE_START,
-                              machine->ram_size - FIRMWARE_START);
-        memory_region_add_subregion_overlap(addr_space, 0, &mem_region[0], -1);
-        memory_region_add_subregion_overlap(addr_space, RAM_MAP_HIGH,
-                                            &mem_region[1], -1);
+        hpm->memsplit_addr = FIRMWARE_START;
+    }
+    splitaddr = hpm->memsplit_addr;
+
+    MemoryRegion *mem_region;
+    mem_region = g_new(MemoryRegion, 1);
+    memory_region_init_alias(&mem_region[0], &addr_space->parent_obj,
+                          "memory0", machine->ram, 0, splitaddr);
+    memory_region_add_subregion_overlap(addr_space, 0, &mem_region[0], -1);
+    if (hppa_is_pa20(&cpu[0]->env)) {
+        if (machine->ram_size > 4 * GiB) {
+            mem_region = g_new(MemoryRegion, 1);
+            memory_region_init_alias(&mem_region[0], &addr_space->parent_obj,
+                          "memory1", machine->ram, 4 * GiB,
+                          machine->ram_size - 4 * GiB);
+            memory_region_add_subregion_overlap(addr_space, RAM_MAP_HIGH1,
+                                        &mem_region[0], -1);
+        }
+        if (machine->ram_size > splitaddr) {
+            mem_region = g_new(MemoryRegion, 1);
+            memory_region_init_alias(&mem_region[0], &addr_space->parent_obj,
+                          "memory2", machine->ram, splitaddr,
+                          4 * GiB - splitaddr);
+            memory_region_add_subregion_overlap(addr_space, RAM_MAP_HIGH2,
+                                        &mem_region[0], -1);
+        }
     }
 
     return translate;
@@ -355,7 +398,8 @@ static void machine_HP_common_init_tail(MachineState *machine, PCIBus *pci_bus,
 {
     const char *kernel_filename = machine->kernel_filename;
     MachineClass *mc = MACHINE_GET_CLASS(machine);
-    DeviceState *dev;
+    HppaMachineState *hpm = HPPA_COMMON_MACHINE(machine);
+    DeviceState *dev, *lasi_dev;
     PCIDevice *pci_dev;
     long size;
     uint64_t kernel_entry = 0;
@@ -364,7 +408,9 @@ static void machine_HP_common_init_tail(MachineState *machine, PCIBus *pci_bus,
     SysBusDevice *s;
 
     /* Graphics setup. */
-    if (machine->enable_graphics && vga_interface_type != VGA_NONE) {
+    lasi_dev = hpm->lasi_dev;
+    if (lasi_dev && machine->enable_graphics &&
+        vga_interface_type != VGA_NONE) {
         dev = qdev_new("artist");
         s = SYS_BUS_DEVICE(dev);
         bool disabled = object_property_get_bool(OBJECT(dev), "disable", NULL);
@@ -507,7 +553,7 @@ static void machine_HP_common_init_tail(MachineState *machine, PCIBus *pci_bus,
             }
 
             load_image_targphys(initrd_filename, initrd_base, initrd_size,
-                                NULL);
+                                &error_fatal);
             cpu[0]->env.initrd_base = initrd_base;
             cpu[0]->env.initrd_end  = initrd_base + initrd_size;
         }
@@ -531,7 +577,8 @@ static void machine_HP_common_init_tail(MachineState *machine, PCIBus *pci_bus,
  */
 static void machine_HP_715_init(MachineState *machine)
 {
-    DeviceState *dev;
+    HppaMachineState *hpm = HPPA_COMMON_MACHINE(machine);
+    DeviceState *dev, *lasi_dev;
     MemoryRegion *addr_space = get_system_memory();
     TranslateFn *translate;
     ISABus *isa_bus;
@@ -551,6 +598,7 @@ static void machine_HP_715_init(MachineState *machine)
 
     /* Init Lasi chip */
     lasi_dev = DEVICE(lasi_init());
+    hpm->lasi_dev = lasi_dev;
     memory_region_add_subregion(addr_space, translate(NULL, LASI_HPA_715),
                                 sysbus_mmio_get_region(
                                     SYS_BUS_DEVICE(lasi_dev), 0));
@@ -607,7 +655,8 @@ static void machine_HP_715_init(MachineState *machine)
  */
 static void machine_HP_B160L_init(MachineState *machine)
 {
-    DeviceState *dev, *dino_dev;
+    HppaMachineState *hpm = HPPA_COMMON_MACHINE(machine);
+    DeviceState *dev, *dino_dev, *lasi_dev;
     MemoryRegion *addr_space = get_system_memory();
     TranslateFn *translate;
     ISABus *isa_bus;
@@ -624,6 +673,7 @@ static void machine_HP_B160L_init(MachineState *machine)
 
     /* Init Lasi chip */
     lasi_dev = DEVICE(lasi_init());
+    hpm->lasi_dev = lasi_dev;
     memory_region_add_subregion(addr_space, translate(NULL, LASI_HPA),
                                 sysbus_mmio_get_region(
                                     SYS_BUS_DEVICE(lasi_dev), 0));
@@ -736,6 +786,10 @@ static void machine_HP_C3700_init(MachineState *machine)
  */
 static void machine_HP_A400_init(MachineState *machine)
 {
+    struct HppaMachineState *hpm;
+
+    hpm = HPPA_COMMON_MACHINE(machine);
+    hpm->memsplit_addr = 1 * GiB;
     machine_HP_C3700_init(machine);
 }
 
@@ -775,7 +829,7 @@ static void hppa_machine_reset(MachineState *ms, ResetType type)
     cpu[0]->env.cmdline_or_bootorder = 'c';
 }
 
-static void hppa_nmi(NMIState *n, int cpu_index, Error **errp)
+static void hppa_nmi(NMIState *ns)
 {
     CPUState *cs;
 
@@ -794,10 +848,10 @@ static void hppa_machine_common_class_init(ObjectClass *oc, const void *data)
     mc->default_cpus = 1;
     mc->max_cpus = HPPA_MAX_CPUS;
     mc->default_boot_order = "cd";
-    mc->default_ram_id = "ram";
+    mc->default_ram_id = "hppa.ram";
     mc->default_nic = "tulip";
 
-    nc->nmi_monitor_handler = hppa_nmi;
+    nc->raise_nmi = hppa_nmi;
 }
 
 static void HP_B160L_machine_init_class_init(ObjectClass *oc, const void *data)
@@ -840,7 +894,7 @@ static void HP_A400_machine_init_class_init(ObjectClass *oc, const void *data)
     };
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->desc = "HP A400-44 workstation";
+    mc->desc = "HP A400-44 server";
     mc->default_cpu_type = TYPE_HPPA_CPU_PA_8500;
     mc->valid_cpu_types = valid_cpu_types;
     mc->init = machine_HP_A400_init;

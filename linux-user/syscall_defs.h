@@ -210,7 +210,7 @@ struct target_ip_mreq {
 struct target_ip_mreqn {
     struct target_in_addr imr_multiaddr;
     struct target_in_addr imr_address;
-    abi_long imr_ifindex;
+    abi_int imr_ifindex;
 };
 
 struct target_ip_mreq_source {
@@ -2005,7 +2005,7 @@ struct target_stat {
     abi_uint __unused5;
 };
 
-#if !defined(TARGET_RISCV64)
+#if !defined(TARGET_RISCV64) && !defined(TARGET_LOONGARCH64)
 #define TARGET_HAS_STRUCT_STAT64
 struct target_stat64 {
     abi_ullong st_dev;
@@ -2593,9 +2593,10 @@ struct target_drm_i915_getparam {
 
 #define FUTEX_PRIVATE_FLAG      128
 #define FUTEX_CLOCK_REALTIME    256
+#ifndef FUTEX_CMD_MASK
 #define FUTEX_CMD_MASK          ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME)
+#endif
 
-#ifdef CONFIG_EPOLL
 #if defined(TARGET_X86_64)
 #define TARGET_EPOLL_PACKED QEMU_PACKED
 #else
@@ -2615,8 +2616,6 @@ struct target_epoll_event {
 } TARGET_EPOLL_PACKED;
 
 #define TARGET_EP_MAX_EVENTS (INT_MAX / sizeof(struct target_epoll_event))
-
-#endif
 
 struct target_ucred {
     abi_uint pid;
@@ -2771,13 +2770,31 @@ struct target_open_how_ver0 {
     abi_ullong mode;
     abi_ullong resolve;
 };
+/* from kernel's include/uapi/linux/mount.h */
+struct mount_attr_ver0 {
+    uint64_t attr_set;
+    uint64_t attr_clr;
+    uint64_t propagation;
+    uint64_t userns_fd;
+};
+struct target_mount_attr_ver0 {
+    abi_ullong attr_set;
+    abi_ullong attr_clr;
+    abi_ullong propagation;
+    abi_ullong userns_fd;
+};
 #ifndef RESOLVE_NO_MAGICLINKS
 #define RESOLVE_NO_MAGICLINKS   0x02
 #endif
 #ifndef RESOLVE_NO_SYMLINKS
 #define RESOLVE_NO_SYMLINKS     0x04
 #endif
-
+#ifndef RESOLVE_BENEATH
+#define RESOLVE_BENEATH         0x08
+#endif
+#ifndef RESOLVE_IN_ROOT
+#define RESOLVE_IN_ROOT         0x10
+#endif
 #if (defined(TARGET_I386) && defined(TARGET_ABI32)) || \
     (defined(TARGET_ARM) && defined(TARGET_ABI32)) || \
     defined(TARGET_M68K) || defined(TARGET_MICROBLAZE) || \

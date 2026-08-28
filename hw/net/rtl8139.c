@@ -778,7 +778,6 @@ static void rtl8139_write_buffer(RTL8139State *s, const void *buf, int size)
     s->RxBufAddr += size;
 }
 
-#define MIN_BUF_SIZE 60
 static inline dma_addr_t rtl8139_addr64(uint32_t low, uint32_t high)
 {
     return low | ((uint64_t)high << 32);
@@ -1007,10 +1006,6 @@ static ssize_t rtl8139_receive(NetClientState *nc,
             lduw_be_p(&buf[ETH_ALEN * 2]) == ETH_P_VLAN) {
             dot1q_buf = &buf[ETH_ALEN * 2];
             size -= VLAN_HLEN;
-            /* if too small buffer, use the tailroom added duing expansion */
-            if (size < MIN_BUF_SIZE) {
-                size = MIN_BUF_SIZE;
-            }
 
             rxdw1 &= ~CP_RX_VLAN_TAG_MASK;
             /* BE + ~le_to_cpu()~ + cpu_to_le() = BE */
@@ -1770,6 +1765,7 @@ static void rtl8139_transfer_frame(RTL8139State *s, uint8_t *buf, int size,
             buf2 = g_malloc(buf2_size);
             iov_to_buf(iov, 3, 0, buf2, buf2_size);
             buf = buf2;
+            size = buf2_size;
         }
 
         DPRINTF("+++ transmit loopback mode\n");
@@ -2124,6 +2120,26 @@ static int rtl8139_cplus_transmit_one(RTL8139State *s)
                     hlen, ip->ip_sum);
             }
 
+            /*
+             * The code in this function triggers a GCC bug where an
+             * interaction between -fsanitize=address and -Wstringop-overflow
+             * results in a false-positive stringop-overflow warning that is
+             * only emitted when the address sanitizer is enabled:
+             *     https://gcc.gnu.org/bugzilla/show_bug.cgi?id=114494
+             *     https://gcc.gnu.org/bugzilla/show_bug.cgi?id=99673
+             * GCC incorrectly thinks that the eth_payload_data buffer has
+             * the type and size of the first field in 'struct ip_header', i.e.
+             * one byte, and then complains about all other attempts to access
+             * data in the buffer.
+             *
+             * Work around this by disabling the warning when building with
+             * GCC and the address sanitizer is enabled.
+             */
+#pragma GCC diagnostic push
+#if !defined(__clang__) && defined(QEMU_SANITIZE_ADDRESS)
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
+
             if ((txdw0 & CP_TX_LGSEN) && ip_protocol == IP_PROTO_TCP)
             {
                 /* Large enough for the TCP header? */
@@ -2307,6 +2323,9 @@ static int rtl8139_cplus_transmit_one(RTL8139State *s)
                 /* restore IP header */
                 memcpy(eth_payload_data, saved_ip_header, hlen);
             }
+
+#pragma GCC diagnostic pop
+
         }
 
 skip_offload:

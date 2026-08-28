@@ -28,6 +28,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/option.h"
 #include "qom/object_interfaces.h"
+#include "qapi-types-char.h"
 #include "system/system.h"
 #include "ui/dbus-module.h"
 #ifdef CONFIG_OPENGL
@@ -141,12 +142,14 @@ dbus_display_finalize(Object *o)
 {
     DBusDisplay *dd = DBUS_DISPLAY(o);
 
+    if (dd->console_notifier.notify) {
+        qemu_console_remove_notifier(&dd->console_notifier);
+    }
     if (dd->notifier.notify) {
         dbus_display_notifier_remove(&dd->notifier);
     }
 
-    qemu_clipboard_peer_unregister(&dd->clipboard_peer);
-    g_clear_object(&dd->clipboard);
+    dbus_clipboard_fini(dd);
 
     g_clear_object(&dd->server);
     g_clear_pointer(&dd->consoles, g_ptr_array_unref);
@@ -164,14 +167,35 @@ dbus_display_finalize(Object *o)
     dbus_display = NULL;
 }
 
-static bool
-dbus_display_add_console(DBusDisplay *dd, int idx, Error **errp)
+static void
+dbus_update_console_ids(DBusDisplay *dd)
 {
-    QemuConsole *con;
+    g_autoptr(GArray) arr = g_array_new(FALSE, FALSE, sizeof(guint32));
+
+    for (guint i = 0; i < dd->consoles->len; i++) {
+        DBusDisplayConsole *ddc = g_ptr_array_index(dd->consoles, i);
+        guint32 idx = dbus_display_console_get_index(ddc);
+        g_array_append_val(arr, idx);
+    }
+
+    g_object_set(dd->iface, "console-ids",
+        g_variant_new_fixed_array(G_VARIANT_TYPE("u"),
+            arr->data, arr->len,
+            sizeof(guint32)),
+        NULL);
+}
+
+static bool
+dbus_display_add_console(DBusDisplay *dd, QemuConsole *con, Error **errp)
+{
     DBusDisplayConsole *dbus_console;
 
-    con = qemu_console_lookup_by_index(idx);
-    assert(con);
+    for (guint i = 0; i < dd->consoles->len; i++) {
+        DBusDisplayConsole *ddc = g_ptr_array_index(dd->consoles, i);
+        if (dbus_display_console_get_qemu_console(ddc) == con) {
+            return true;
+        }
+    }
 
     if (qemu_console_is_graphic(con) &&
         dd->gl_mode != DISPLAY_GL_MODE_OFF) {
@@ -179,10 +203,50 @@ dbus_display_add_console(DBusDisplay *dd, int idx, Error **errp)
     }
 
     dbus_console = dbus_display_console_new(dd, con);
-    g_ptr_array_insert(dd->consoles, idx, dbus_console);
+    g_ptr_array_add(dd->consoles, dbus_console);
     g_dbus_object_manager_server_export(dd->server,
                                         G_DBUS_OBJECT_SKELETON(dbus_console));
+    dbus_update_console_ids(dd);
     return true;
+}
+
+static void
+dbus_display_remove_console(DBusDisplay *dd, QemuConsole *con)
+{
+    for (guint i = 0; i < dd->consoles->len; i++) {
+        DBusDisplayConsole *ddc = g_ptr_array_index(dd->consoles, i);
+        if (dbus_display_console_get_qemu_console(ddc) == con) {
+            if (display_opengl) {
+                qemu_console_set_display_gl_ctx(con, NULL);
+            }
+            g_dbus_object_manager_server_unexport(
+                dd->server,
+                g_dbus_object_get_object_path(G_DBUS_OBJECT(ddc)));
+            g_ptr_array_remove_index(dd->consoles, i);
+            dbus_update_console_ids(dd);
+            break;
+        }
+    }
+}
+
+static void
+dbus_console_notify(Notifier *n, void *data)
+{
+    DBusDisplay *dd = container_of(n, DBusDisplay, console_notifier);
+    QemuConsoleEvent *event = data;
+
+    switch (event->type) {
+    case QEMU_CONSOLE_ADDED: {
+        Error *err = NULL;
+        if (!dbus_display_add_console(dd, event->con, &err)) {
+            error_report_err(err);
+        }
+        break;
+    }
+    case QEMU_CONSOLE_REMOVED:
+        dbus_display_remove_console(dd, event->con);
+        break;
+    }
 }
 
 static void
@@ -191,8 +255,6 @@ dbus_display_complete(UserCreatable *uc, Error **errp)
     DBusDisplay *dd = DBUS_DISPLAY(uc);
     g_autoptr(GError) err = NULL;
     g_autofree char *uuid = qemu_uuid_unparse_strdup(&qemu_uuid);
-    g_autoptr(GArray) consoles = NULL;
-    GVariant *console_ids;
     int idx;
 
     if (!object_resolve_path_type("", TYPE_DBUS_DISPLAY, NULL)) {
@@ -233,27 +295,24 @@ dbus_display_complete(UserCreatable *uc, Error **errp)
         }
     }
 
-    consoles = g_array_new(FALSE, FALSE, sizeof(guint32));
     for (idx = 0;; idx++) {
-        if (!qemu_console_lookup_by_index(idx)) {
+        QemuConsole *con = qemu_console_lookup_by_index(idx);
+        if (!con) {
             break;
         }
-        if (!dbus_display_add_console(dd, idx, errp)) {
+        if (!dbus_display_add_console(dd, con, errp)) {
             return;
         }
-        g_array_append_val(consoles, idx);
     }
 
-    console_ids = g_variant_new_from_data(
-        G_VARIANT_TYPE("au"),
-        consoles->data, consoles->len * sizeof(guint32), TRUE,
-        (GDestroyNotify)g_array_unref, consoles);
-    g_steal_pointer(&consoles);
     g_object_set(dd->iface,
                  "name", qemu_name ?: "QEMU " QEMU_VERSION,
                  "uuid", uuid,
-                 "console-ids", console_ids,
                  NULL);
+    dbus_update_console_ids(dd);
+
+    dd->console_notifier.notify = dbus_console_notify;
+    qemu_console_add_notifier(&dd->console_notifier);
 
     if (dd->bus) {
         g_dbus_object_manager_server_set_connection(dd->server, dd->bus);
@@ -263,22 +322,52 @@ dbus_display_complete(UserCreatable *uc, Error **errp)
     }
 }
 
+typedef struct DBusDisplayAddClientData {
+    DBusDisplay *display;
+    GCancellable *cancellable;
+} DBusDisplayAddClientData;
+
+static void dbus_display_add_client_data_free(DBusDisplayAddClientData *data)
+{
+    if (data->display) {
+        object_unref(OBJECT(data->display));
+        data->display = NULL;
+    }
+    g_clear_object(&data->cancellable);
+    g_free(data);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(DBusDisplayAddClientData,
+                              dbus_display_add_client_data_free)
+
 static void
 dbus_display_add_client_ready(GObject *source_object,
                               GAsyncResult *res,
                               gpointer user_data)
 {
+    g_autoptr(DBusDisplayAddClientData) data = user_data;
+    DBusDisplay *display = data->display;
+    bool current = display->add_client_cancellable == data->cancellable;
     g_autoptr(GError) err = NULL;
     g_autoptr(GDBusConnection) conn = NULL;
 
-    g_clear_object(&dbus_display->add_client_cancellable);
+    if (current) {
+        g_clear_object(&display->add_client_cancellable);
+    }
 
     conn = g_dbus_connection_new_finish(res, &err);
     if (!conn) {
-        error_printf("Failed to accept D-Bus client: %s", err->message);
+        if (!g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+            error_printf("Failed to accept D-Bus client: %s", err->message);
+        }
+        return;
     }
 
-    g_dbus_object_manager_server_set_connection(dbus_display->server, conn);
+    if (!current) {
+        return;
+    }
+
+    g_dbus_object_manager_server_set_connection(display->server, conn);
     g_dbus_connection_start_message_processing(conn);
 }
 
@@ -290,6 +379,7 @@ dbus_display_add_client(int csock, Error **errp)
     g_autoptr(GSocket) socket = NULL;
     g_autoptr(GSocketConnection) conn = NULL;
     g_autofree char *guid = g_dbus_generate_guid();
+    DBusDisplayAddClientData *data;
 
     if (!dbus_display) {
         error_setg(errp, "p2p connections not accepted in bus mode");
@@ -298,6 +388,7 @@ dbus_display_add_client(int csock, Error **errp)
 
     if (dbus_display->add_client_cancellable) {
         g_cancellable_cancel(dbus_display->add_client_cancellable);
+        g_clear_object(&dbus_display->add_client_cancellable);
     }
 
 #ifdef WIN32
@@ -318,6 +409,10 @@ dbus_display_add_client(int csock, Error **errp)
     conn = g_socket_connection_factory_create_connection(socket);
 
     dbus_display->add_client_cancellable = g_cancellable_new();
+    data = g_new0(DBusDisplayAddClientData, 1);
+    data->display = DBUS_DISPLAY(object_ref(OBJECT(dbus_display)));
+    data->cancellable = g_object_ref(dbus_display->add_client_cancellable);
+
     GDBusConnectionFlags flags =
         G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_SERVER |
         G_DBUS_CONNECTION_FLAGS_DELAY_MESSAGE_PROCESSING;
@@ -332,7 +427,7 @@ dbus_display_add_client(int csock, Error **errp)
                           NULL,
                           dbus_display->add_client_cancellable,
                           dbus_display_add_client_ready,
-                          NULL);
+                          data);
 
     return true;
 }
@@ -420,12 +515,20 @@ dbus_display_class_init(ObjectClass *oc, const void *data)
 
 #define TYPE_CHARDEV_VC "chardev-vc"
 
+typedef struct DBusVCChardev {
+    DBusChardev parent;
+
+    ChardevVCEncoding encoding;
+} DBusVCChardev;
+
 typedef struct DBusVCClass {
     DBusChardevClass parent_class;
 
     void (*parent_parse)(QemuOpts *opts, ChardevBackend *b, Error **errp);
 } DBusVCClass;
 
+DECLARE_INSTANCE_CHECKER(DBusVCChardev, DBUS_VC_CHARDEV,
+                         TYPE_CHARDEV_VC)
 DECLARE_CLASS_CHECKERS(DBusVCClass, DBUS_VC,
                        TYPE_CHARDEV_VC)
 
@@ -436,6 +539,8 @@ dbus_vc_parse(QemuOpts *opts, ChardevBackend *backend,
     DBusVCClass *klass = DBUS_VC_CLASS(object_class_by_name(TYPE_CHARDEV_VC));
     const char *name = qemu_opt_get(opts, "name");
     const char *id = qemu_opts_id(opts);
+    const char *str;
+    ChardevDBus *dbus;
 
     if (name == NULL) {
         if (g_str_has_prefix(id, "compat_monitor")) {
@@ -451,6 +556,39 @@ dbus_vc_parse(QemuOpts *opts, ChardevBackend *backend,
     }
 
     klass->parent_parse(opts, backend, errp);
+    dbus = backend->u.dbus.data;
+    str = qemu_opt_get(opts, "encoding");
+    if (str) {
+        int cs = qapi_enum_parse(&ChardevVCEncoding_lookup, str, -1, errp);
+        if (cs < 0) {
+            return;
+        }
+        dbus->has_encoding = true;
+        dbus->encoding = cs;
+    }
+}
+
+CHARDEV_VC_ENCODING_PROPERTY_DEFINE(DBUS_VC_CHARDEV)
+
+static bool
+dbus_vc_open(Chardev *chr, ChardevBackend *backend, Error **errp)
+{
+    DBusChardev *dc = DBUS_CHARDEV(chr);
+    DBusVCChardev *vc = DBUS_VC_CHARDEV(chr);
+    ChardevClass *parent =
+        CHARDEV_CLASS(object_class_by_name(TYPE_CHARDEV_DBUS));
+    ChardevDBus *be = backend->u.dbus.data;
+
+    if (be->has_encoding) {
+        vc->encoding = be->encoding;
+    }
+    dc->iface_vc_encoding =
+        qemu_dbus_display1_chardev_vcencoding_skeleton_new();
+    qemu_dbus_display1_chardev_vcencoding_set_encoding(
+        dc->iface_vc_encoding,
+        qapi_enum_lookup(&ChardevVCEncoding_lookup, vc->encoding));
+
+    return parent->chr_open(chr, backend, errp);
 }
 
 static void
@@ -461,11 +599,26 @@ dbus_vc_class_init(ObjectClass *oc, const void *data)
 
     klass->parent_parse = cc->chr_parse;
     cc->chr_parse = dbus_vc_parse;
+    cc->chr_open = dbus_vc_open;
+    cc->supports_encoding_opts = true;
+
+    chardev_vc_add_encoding_prop(oc, get_encoding, set_encoding);
+}
+
+static void
+dbus_vc_init(Object *obj)
+{
+    DBusVCChardev *vc = DBUS_VC_CHARDEV(obj);
+
+    vc->encoding = CHARDEV_VC_ENCODING_UTF8;
 }
 
 static const TypeInfo dbus_vc_type_info = {
     .name = TYPE_CHARDEV_VC,
     .parent = TYPE_CHARDEV_DBUS,
+    .instance_size = sizeof(DBusVCChardev),
+    .instance_init = dbus_vc_init,
+    .instance_post_init = object_apply_compat_props,
     .class_size = sizeof(DBusVCClass),
     .class_init = dbus_vc_class_init,
 };
@@ -521,10 +674,23 @@ static const TypeInfo dbus_display_info = {
     }
 };
 
+static void
+dbus_cleanup(void)
+{
+    Object *o;
+
+    o = object_resolve_path_component(object_get_objects_root(),
+                                      "dbus-display");
+    if (o) {
+        object_unparent(o);
+    }
+}
+
 static QemuDisplay qemu_display_dbus = {
     .type       = DISPLAY_TYPE_DBUS,
     .early_init = early_dbus_init,
     .init       = dbus_init,
+    .cleanup    = dbus_cleanup,
     .vc         = "vc",
 };
 

@@ -14,6 +14,7 @@
 #include "qemu/osdep.h"
 
 #include "qemu/aio.h"
+#include "qemu/aio-wait.h"
 #include "qapi/compat-policy.h"
 #include "qapi/error.h"
 #include "qapi/qmp-registry.h"
@@ -24,6 +25,7 @@
 #include "qobject/qbool.h"
 #include "qemu/coroutine.h"
 #include "qemu/main-loop.h"
+#include "monitor/monitor.h"
 
 Visitor *qobject_input_visitor_new_qmp(QObject *obj)
 {
@@ -128,6 +130,16 @@ static void do_qmp_dispatch_bh(void *opaque)
     data->cmd->fn(data->args, data->ret, data->errp);
     monitor_set_cur(qemu_coroutine_self(), NULL);
     aio_co_wake(data->co);
+
+    /*
+     * If the QMP dispatcher coroutine is waiting to be scheduled
+     * in iohandler_ctx, we must kick the main loop. This ensures
+     * that AIO_WAIT_WHILE_UNLOCKED() in monitor_cleanup() doesn't
+     * block indefinitely waiting for an event in qemu_aio_context,
+     * but actually gets the chance to poll iohandler_ctx and resume
+     * the coroutine.
+     */
+    aio_wait_kick();
 }
 
 /*

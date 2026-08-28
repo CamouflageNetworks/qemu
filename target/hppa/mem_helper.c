@@ -21,12 +21,14 @@
 #include "qemu/log.h"
 #include "cpu.h"
 #include "exec/cputlb.h"
+#include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/cpu-mmu-index.h"
 #include "accel/tcg/probe.h"
 #include "exec/page-protection.h"
 #include "exec/target_page.h"
 #include "exec/helper-proto.h"
 #include "hw/core/cpu.h"
+#include "hw/hppa/hppa_hardware.h"
 #include "trace.h"
 
 hwaddr hppa_abs_to_phys_pa1x(uint8_t phys_addr_bits, vaddr addr)
@@ -66,12 +68,13 @@ hwaddr hppa_abs_to_phys_pa2_w0(uint8_t phys_addr_bits, vaddr addr)
         /*
          * PDC address space:
          * Figures H-10 and H-11 of the parisc2.0 spec do not specify
-         * where to map into the 64-bit PDC address space.
-         * We map with an offset which equals the 32-bit address, which
-         * is what can be seen on physical machines too.
+         * where to map into the 64-bit PDC address space, but verification
+         * on physical A500, C3700 and C8000 machines show that PDC is always
+         * mapped at 0xfffffff0f0000000, independed if the CPU has 40 or 44
+         * physical bits.
          */
         addr = (uint32_t)addr;
-        addr |= -1ull << (phys_addr_bits - 4);
+        addr |= ((uint64_t) FIRMWARE_HIGH) << 32;
     }
     return addr;
 }
@@ -343,7 +346,7 @@ int hppa_get_physical_address(CPUHPPAState *env, vaddr addr, int mmu_idx,
     return ret;
 }
 
-hwaddr hppa_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
+hwaddr hppa_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
 {
     HPPACPU *cpu = HPPA_CPU(cs);
     hwaddr phys;

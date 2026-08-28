@@ -119,7 +119,7 @@ static uint64_t vu_blk_get_features(VuDev *dev)
     uint64_t features;
     VuServer *server = container_of(dev, VuServer, vu_dev);
     VuBlkExport *vexp = container_of(server, VuBlkExport, vu_server);
-    features = 1ull << VIRTIO_BLK_F_SIZE_MAX |
+    features =
                1ull << VIRTIO_BLK_F_SEG_MAX |
                1ull << VIRTIO_BLK_F_TOPOLOGY |
                1ull << VIRTIO_BLK_F_BLK_SIZE |
@@ -242,8 +242,8 @@ vu_blk_initialize_config(BlockDriverState *bs,
     config->blk_size = cpu_to_le32(blk_size);
     config->size_max = cpu_to_le32(0);
     config->seg_max = cpu_to_le32(128 - 2);
-    config->min_io_size = cpu_to_le16(1);
-    config->opt_io_size = cpu_to_le32(1);
+    config->min_io_size = cpu_to_le16(0);
+    config->opt_io_size = cpu_to_le32(0);
     config->num_queues = cpu_to_le16(num_queues);
     config->max_discard_sectors =
         cpu_to_le32(VIRTIO_BLK_MAX_DISCARD_SECTORS);

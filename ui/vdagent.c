@@ -5,7 +5,10 @@
 #include "qemu/error-report.h"
 #include "qemu/option.h"
 #include "qemu/units.h"
+#include "qom/compat-properties.h"
 #include "hw/core/qdev.h"
+#include "hw/core/qdev-properties.h"
+#include "migration/blocker.h"
 #include "ui/clipboard.h"
 #include "ui/console.h"
 #include "ui/input.h"
@@ -23,6 +26,10 @@
 
 struct VDAgentChardev {
     Chardev parent;
+
+    /* needed for machine versions < 10.1 when migration was not supported */
+    Error *migration_blocker;
+    bool migration_blocked;
 
     /* config */
     bool mouse;
@@ -219,7 +226,7 @@ static void vdagent_send_mouse(VDAgentChardev *vd)
 }
 
 static void vdagent_pointer_event(DeviceState *dev, QemuConsole *src,
-                                  InputEvent *evt)
+                                  QemuInputEvent *evt)
 {
     static const int bmap[INPUT_BUTTON__MAX] = {
         [INPUT_BUTTON_LEFT]        = VD_AGENT_LBUTTON_MASK,
@@ -234,22 +241,19 @@ static void vdagent_pointer_event(DeviceState *dev, QemuConsole *src,
     };
 
     VDAgentChardev *vd = container_of(dev, struct VDAgentChardev, mouse_dev);
-    InputMoveEvent *move;
-    InputBtnEvent *btn;
     uint32_t xres, yres;
 
     switch (evt->type) {
     case INPUT_EVENT_KIND_ABS:
-        move = evt->u.abs.data;
         xres = qemu_console_get_width(src, 1024);
         yres = qemu_console_get_height(src, 768);
-        if (move->axis == INPUT_AXIS_X) {
-            vd->mouse_x = qemu_input_scale_axis(move->value,
+        if (evt->abs.axis == INPUT_AXIS_X) {
+            vd->mouse_x = qemu_input_scale_axis(evt->abs.value,
                                                 INPUT_EVENT_ABS_MIN,
                                                 INPUT_EVENT_ABS_MAX,
                                                 0, xres);
-        } else if (move->axis == INPUT_AXIS_Y) {
-            vd->mouse_y = qemu_input_scale_axis(move->value,
+        } else if (evt->abs.axis == INPUT_AXIS_Y) {
+            vd->mouse_y = qemu_input_scale_axis(evt->abs.value,
                                                 INPUT_EVENT_ABS_MIN,
                                                 INPUT_EVENT_ABS_MAX,
                                                 0, yres);
@@ -258,11 +262,10 @@ static void vdagent_pointer_event(DeviceState *dev, QemuConsole *src,
         break;
 
     case INPUT_EVENT_KIND_BTN:
-        btn = evt->u.btn.data;
-        if (btn->down) {
-            vd->mouse_btn |= bmap[btn->button];
+        if (evt->btn.down) {
+            vd->mouse_btn |= bmap[evt->btn.button];
         } else {
-            vd->mouse_btn &= ~bmap[btn->button];
+            vd->mouse_btn &= ~bmap[evt->btn.button];
         }
         break;
 
@@ -657,6 +660,12 @@ static bool vdagent_chr_open(Chardev *chr, ChardevBackend *backend,
     return false;
 #endif
 
+    if (vd->migration_blocked) {
+        if (migrate_add_blocker(&vd->migration_blocker, errp) != 0) {
+            return false;
+        }
+    }
+
     vd->mouse = VDAGENT_MOUSE_DEFAULT;
     if (cfg->has_mouse) {
         vd->mouse = cfg->mouse;
@@ -901,6 +910,19 @@ static void vdagent_chr_parse(QemuOpts *opts, ChardevBackend *backend,
 
 /* ------------------------------------------------------------------ */
 
+static bool get_migration_blocked(Object *o, Error **errp)
+{
+    VDAgentChardev *vd = QEMU_VDAGENT_CHARDEV(o);
+    return vd->migration_blocked;
+}
+
+static void set_migration_blocked(Object *o, bool migration_blocked,
+                                   Error **errp)
+{
+    VDAgentChardev *vd = QEMU_VDAGENT_CHARDEV(o);
+    vd->migration_blocked = migration_blocked;
+}
+
 static void vdagent_chr_class_init(ObjectClass *oc, const void *data)
 {
     ChardevClass *cc = CHARDEV_CLASS(oc);
@@ -910,6 +932,10 @@ static void vdagent_chr_class_init(ObjectClass *oc, const void *data)
     cc->chr_write        = vdagent_chr_write;
     cc->chr_set_fe_open  = vdagent_chr_set_fe_open;
     cc->chr_accept_input = vdagent_chr_accept_input;
+
+    object_class_property_add_bool(oc, "x-migration-blocked",
+                                   get_migration_blocked,
+                                   set_migration_blocked);
 }
 
 static int post_load(void *opaque, int version_id)
@@ -934,17 +960,6 @@ static const VMStateDescription vmstate_chunk = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(port, VDIChunkHeader),
         VMSTATE_UINT32(size, VDIChunkHeader),
-        VMSTATE_END_OF_LIST()
-    }
-};
-
-static const VMStateDescription vmstate_vdba = {
-    .name = "vdagent/bytearray",
-    .version_id = 0,
-    .minimum_version_id = 0,
-    .fields = (const VMStateField[]) {
-        VMSTATE_UINT32(len, GByteArray),
-        VMSTATE_VBUFFER_ALLOC_UINT32(data, GByteArray, 0, 0, len),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1038,7 +1053,7 @@ static const VMStateDescription vmstate_vdagent = {
         VMSTATE_UINT32(xsize, VDAgentChardev),
         VMSTATE_UINT32(xoff, VDAgentChardev),
         VMSTATE_VBUFFER_ALLOC_UINT32(xbuf, VDAgentChardev, 0, 0, xsize),
-        VMSTATE_STRUCT_POINTER(outbuf, VDAgentChardev, vmstate_vdba, GByteArray),
+        VMSTATE_GBYTEARRAY(outbuf, VDAgentChardev, 0),
         VMSTATE_UINT32(mouse_x, VDAgentChardev),
         VMSTATE_UINT32(mouse_y, VDAgentChardev),
         VMSTATE_UINT32(mouse_btn, VDAgentChardev),
@@ -1064,10 +1079,26 @@ static void vdagent_chr_instance_init(Object *obj)
     vmstate_register_any(NULL, &vmstate_vdagent, vd);
 }
 
+static void vdagent_post_init(Object *obj)
+{
+    VDAgentChardev *vd = QEMU_VDAGENT_CHARDEV(obj);
+
+    object_apply_compat_props(obj);
+
+    if (vd->migration_blocked) {
+        error_setg(&vd->migration_blocker,
+                   "The vdagent chardev doesn't support migration with machine"
+                   " version less than 10.1");
+    }
+}
+
 static void vdagent_chr_fini(Object *obj)
 {
     VDAgentChardev *vd = QEMU_VDAGENT_CHARDEV(obj);
 
+    if (vd->migration_blocked) {
+        migrate_del_blocker(&vd->migration_blocker);
+    }
     vdagent_disconnect(vd);
     if (vd->mouse_hs) {
         qemu_input_handler_unregister(vd->mouse_hs);
@@ -1080,6 +1111,7 @@ static const TypeInfo vdagent_chr_type_info = {
     .parent = TYPE_CHARDEV,
     .instance_size = sizeof(VDAgentChardev),
     .instance_init = vdagent_chr_instance_init,
+    .instance_post_init = vdagent_post_init,
     .instance_finalize = vdagent_chr_fini,
     .class_init = vdagent_chr_class_init,
 };

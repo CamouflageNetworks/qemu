@@ -91,14 +91,16 @@ static const MemoryRegionOps static_ops = {
 #define FLASH1_SIZE     (8 * MiB)
 #define FLASH2_SIZE     (32 * MiB)
 
-static struct arm_boot_info sx1_binfo = {
-    .loader_start = OMAP_EMIFF_BASE,
-    .ram_size = SDRAM_SIZE,
-    .board_id = 0x265,
-};
+typedef struct Sx1MachineState {
+    MachineState parent;
+
+    struct arm_boot_info bootinfo;
+} Sx1MachineState;
 
 static void sx1_init(MachineState *machine, const int version)
 {
+    /* Both sx1 and sx1-v1 embed the same state as their first member */
+    Sx1MachineState *sms = (Sx1MachineState *)machine;
     struct omap_mpu_state_s *mpu;
     MachineClass *mc = MACHINE_GET_CLASS(machine);
     MemoryRegion *address_space = get_system_memory();
@@ -146,7 +148,7 @@ static void sx1_init(MachineState *machine, const int version)
     memory_region_init_io(&cs[3], NULL, &static_ops, &cs3val,
                           "sx1.cs3", OMAP_CS3_SIZE);
     memory_region_add_subregion(address_space,
-                                OMAP_CS2_BASE, &cs[3]);
+                                OMAP_CS3_BASE, &cs[3]);
 
     fl_idx = 0;
     if ((dinfo = drive_get(IF_PFLASH, 0, fl_idx)) != NULL) {
@@ -187,7 +189,10 @@ static void sx1_init(MachineState *machine, const int version)
     }
 
     /* Load the kernel.  */
-    arm_load_kernel(mpu->cpu, machine, &sx1_binfo);
+    sms->bootinfo.loader_start = OMAP_EMIFF_BASE;
+    sms->bootinfo.ram_size = SDRAM_SIZE;
+    sms->bootinfo.board_id = 0x265;
+    arm_load_kernel(mpu->cpu, machine, &sms->bootinfo);
 
     /* TODO: fix next line */
     //~ qemu_console_resize(ds, 640, 480);
@@ -220,6 +225,7 @@ static const TypeInfo sx1_machine_v2_type = {
     .name = MACHINE_TYPE_NAME("sx1"),
     .parent = TYPE_MACHINE,
     .class_init = sx1_machine_v2_class_init,
+    .instance_size = sizeof(Sx1MachineState),
     .interfaces = arm_machine_interfaces,
 };
 
@@ -240,6 +246,7 @@ static const TypeInfo sx1_machine_v1_type = {
     .name = MACHINE_TYPE_NAME("sx1-v1"),
     .parent = TYPE_MACHINE,
     .class_init = sx1_machine_v1_class_init,
+    .instance_size = sizeof(Sx1MachineState),
     .interfaces = arm_machine_interfaces,
 };
 

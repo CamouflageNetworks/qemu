@@ -28,12 +28,12 @@
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
 #include "qapi/error.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/usb/usb.h"
 #include "migration/vmstate.h"
 #include "hw/core/sysbus.h"
-#include "hw/core/qdev-dma.h"
 #include "hw/core/qdev-properties.h"
 #include "trace.h"
 #include "hcd-ohci.h"
@@ -746,16 +746,16 @@ static int ohci_service_iso_td(OHCIState *ohci, struct ohci_ed *ed)
     usb_packet_setup(pkt, pid, ep, 0, addr, false, int_req);
     usb_packet_addbuf(pkt, buf, len);
     usb_handle_packet(dev, pkt);
-    if (pkt->status == USB_RET_ASYNC) {
-        usb_device_flush_ep_queue(dev, ep);
-        g_free(pkt);
-        return 1;
-    }
+
+    /* The USB core guarantees to never defer ISO TDs. */
+    assert(pkt->status != USB_RET_ASYNC);
+
     if (pkt->status == USB_RET_SUCCESS) {
         ret = pkt->actual_length;
     } else {
         ret = pkt->status;
     }
+    usb_packet_cleanup(pkt);
     g_free(pkt);
 
     trace_usb_ohci_iso_td_so(start_offset, end_offset, start_addr, end_addr,
@@ -956,6 +956,17 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
         if (len && dir != OHCI_TD_DIR_IN) {
             /* The endpoint may not allow us to transfer it all now */
             pktlen = (ed->flags & OHCI_ED_MPS_MASK) >> OHCI_ED_MPS_SHIFT;
+            /*
+             * The OHCI spec does not say what to do if the guest hands us
+             * an endpoint descriptor which specifies a MaximumPacketSize
+             * of zero, which would mean we can never actually make forward
+             * progress transferring data to it. We choose to treat it as
+             * an error.
+             */
+            if (pktlen == 0) {
+                ohci_die(ohci);
+                return 1;
+            }
             if (pktlen > len) {
                 pktlen = len;
             }
@@ -1118,6 +1129,8 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
         return 0;
     }
     for (cur = head; cur && link_cnt++ < ED_LINK_LIMIT; cur = next_ed) {
+        unsigned int ed_cnt = 0;
+
         if (ohci_read_ed(ohci, cur, &ed)) {
             trace_usb_ohci_ed_read_error(cur);
             ohci_die(ohci);
@@ -1160,6 +1173,13 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
                 if (ohci_service_iso_td(ohci, &ed)) {
                     break;
                 }
+            }
+
+            if (ed_cnt++ > ED_LINK_LIMIT) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "ohci: Too many endpoint descriptors in loop\n");
+                ohci_die(ohci);
+                return 0;
             }
         }
 

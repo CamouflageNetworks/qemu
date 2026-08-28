@@ -209,7 +209,7 @@ static inline void tcx24_draw_line32(TCXState *s1, uint8_t *d,
 /* Fixed line length 1024 allows us to do nice tricks not possible on
    VGA... */
 
-static void tcx_update_display(void *opaque)
+static bool tcx_update_display(void *opaque)
 {
     TCXState *ts = opaque;
     DisplaySurface *surface = qemu_console_surface(ts->con);
@@ -243,8 +243,7 @@ static void tcx_update_display(void *opaque)
         } else {
             if (y_start >= 0) {
                 /* flush to display */
-                dpy_gfx_update(ts->con, 0, y_start,
-                               ts->width, y - y_start);
+                qemu_console_update(ts->con, 0, y_start, ts->width, y - y_start);
                 y_start = -1;
             }
         }
@@ -253,13 +252,13 @@ static void tcx_update_display(void *opaque)
     }
     if (y_start >= 0) {
         /* flush to display */
-        dpy_gfx_update(ts->con, 0, y_start,
-                       ts->width, y - y_start);
+        qemu_console_update(ts->con, 0, y_start, ts->width, y - y_start);
     }
     g_free(snap);
+    return true;
 }
 
-static void tcx24_update_display(void *opaque)
+static bool tcx24_update_display(void *opaque)
 {
     TCXState *ts = opaque;
     DisplaySurface *surface = qemu_console_surface(ts->con);
@@ -296,8 +295,7 @@ static void tcx24_update_display(void *opaque)
         } else {
             if (y_start >= 0) {
                 /* flush to display */
-                dpy_gfx_update(ts->con, 0, y_start,
-                               ts->width, y - y_start);
+                qemu_console_update(ts->con, 0, y_start, ts->width, y - y_start);
                 y_start = -1;
             }
         }
@@ -308,10 +306,10 @@ static void tcx24_update_display(void *opaque)
     }
     if (y_start >= 0) {
         /* flush to display */
-        dpy_gfx_update(ts->con, 0, y_start,
-                       ts->width, y - y_start);
+        qemu_console_update(ts->con, 0, y_start, ts->width, y - y_start);
     }
     g_free(snap);
+    return true;
 }
 
 static void tcx_invalidate_display(void *opaque)
@@ -751,10 +749,15 @@ static const GraphicHwOps tcx24_ops = {
     .gfx_update = tcx24_update_display,
 };
 
-static void tcx_initfn(Object *obj)
+static void tcx_realize(DeviceState *dev, Error **errp)
 {
-    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
-    TCXState *s = TCX(obj);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    TCXState *s = TCX(dev);
+    Object *obj = OBJECT(dev);
+    ram_addr_t vram_offset = 0;
+    int size, ret;
+    uint8_t *vram_base;
+    char *fcode_filename;
 
     memory_region_init_rom(&s->rom, obj, "tcx.prom", FCODE_MAX_ROM_SIZE,
                            &error_fatal);
@@ -804,16 +807,6 @@ static void tcx_initfn(Object *obj)
     memory_region_init_io(&s->alt, obj, &tcx_dummy_ops, s, "tcx.alt",
                           TCX_ALT_NREGS);
     sysbus_init_mmio(sbd, &s->alt);
-}
-
-static void tcx_realizefn(DeviceState *dev, Error **errp)
-{
-    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
-    TCXState *s = TCX(dev);
-    ram_addr_t vram_offset = 0;
-    int size, ret;
-    uint8_t *vram_base;
-    char *fcode_filename;
 
     memory_region_init_ram(&s->vram_mem, OBJECT(s), "tcx.vram",
                            s->vram_size * (1 + 4 + 4), &error_fatal);
@@ -867,9 +860,9 @@ static void tcx_realizefn(DeviceState *dev, Error **errp)
     sysbus_init_irq(sbd, &s->irq);
 
     if (s->depth == 8) {
-        s->con = graphic_console_init(dev, 0, &tcx_ops, s);
+        s->con = qemu_graphic_console_create(dev, 0, &tcx_ops, s);
     } else {
-        s->con = graphic_console_init(dev, 0, &tcx24_ops, s);
+        s->con = qemu_graphic_console_create(dev, 0, &tcx24_ops, s);
     }
     s->thcmisc = 0;
 
@@ -887,7 +880,7 @@ static void tcx_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->realize = tcx_realizefn;
+    dc->realize = tcx_realize;
     device_class_set_legacy_reset(dc, tcx_reset);
     dc->vmsd = &vmstate_tcx;
     device_class_set_props(dc, tcx_properties);
@@ -897,7 +890,6 @@ static const TypeInfo tcx_info = {
     .name          = TYPE_TCX,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(TCXState),
-    .instance_init = tcx_initfn,
     .class_init    = tcx_class_init,
 };
 

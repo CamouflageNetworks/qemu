@@ -32,7 +32,7 @@ const HPET_REG_SPACE_LEN: u64 = 0x400; // 1024 bytes
 /// Minimum recommended hardware implementation.
 const HPET_MIN_TIMERS: usize = 3;
 /// Maximum timers in each timer block.
-const HPET_MAX_TIMERS: usize = 32;
+const HPET_MAX_TIMERS: usize = 24;
 
 /// Flags that HPETState.flags supports.
 const HPET_FLAG_MSI_SUPPORT_SHIFT: usize = 0;
@@ -938,9 +938,7 @@ impl HPETState {
         let mut regs = self.regs.borrow_mut();
         let cnt = regs.counter;
 
-        for index in 0..self.num_timers {
-            let tn_regs = &mut regs.tn_regs[index];
-
+        for tn_regs in regs.tn_regs.iter_mut().take(self.num_timers) {
             tn_regs.update_cmp64(cnt);
             tn_regs.last = CLOCK_VIRTUAL.get_ns() - NANOSECONDS_PER_SECOND;
         }

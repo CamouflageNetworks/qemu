@@ -172,7 +172,7 @@ fi
 # some defaults, based on the host environment
 
 # default parameters
-container_engine="auto"
+container_command=""
 cpu=""
 cross_compile="no"
 cross_prefix=""
@@ -248,7 +248,6 @@ for opt do
   esac
 done
 
-default_cflags='-O2 -g'
 git_submodules_action="update"
 docs="auto"
 EXESUF=""
@@ -372,6 +371,8 @@ elif check_define __APPLE__; then
 elif check_define EMSCRIPTEN ; then
   host_os=emscripten
   cross_compile="yes"
+elif check_define __GNU__; then
+  host_os=gnu
 else
   # This is a fatal error, but don't report it yet, because we
   # might be going to just print the --help text, or it might
@@ -400,14 +401,8 @@ elif check_define _ARCH_PPC64 ; then
   else
     cpu="ppc64"
   fi
-elif check_define __mips64 ; then
-  cpu="mips64"
-elif check_define __s390__ ; then
-  if check_define __s390x__ ; then
-    cpu="s390x"
-  else
-    cpu="s390"
-  fi
+elif check_define __s390x__ ; then
+  cpu="s390x"
 elif check_define __riscv && check_define _LP64 ; then
   cpu="riscv64"
 elif check_define __aarch64__ ; then
@@ -447,12 +442,6 @@ case "$cpu" in
     linux_arch=loongarch
     ;;
 
-  mips64*|mipsisa64*)
-    cpu=mips64
-    host_arch=mips64
-    linux_arch=mips
-    ;;
-
   ppc64)
     host_arch=ppc64
     linux_arch=powerpc
@@ -470,10 +459,6 @@ case "$cpu" in
     linux_arch=riscv
     ;;
 
-  s390)
-    linux_arch=s390
-    CPU_CFLAGS="-m31"
-    ;;
   s390x)
     host_arch=s390x
     linux_arch=s390
@@ -707,7 +692,6 @@ for opt do
       meson_option_parse --enable-debug-graph-lock ""
       meson_option_parse --enable-debug-mutex ""
       meson_option_add -Doptimization=0
-      default_cflags='-O0 -g'
   ;;
   --disable-tcg) tcg="disabled"
   ;;
@@ -750,7 +734,7 @@ for opt do
   ;;
   --disable-containers) use_containers="no"
   ;;
-  --container-engine=*) container_engine="$optarg"
+  --container-command=*) container_command="$optarg"
   ;;
   --rust-target-triple=*) rust_target_triple="$optarg"
   ;;
@@ -885,7 +869,7 @@ Advanced options (experts only):
   --enable-debug           enable common debug build options
   --cpu=CPU                Build for host CPU [$cpu]
   --disable-containers     don't use containers for cross-building
-  --container-engine=TYPE  which container engine to use [$container_engine]
+  --container-command=CMD  which container command to use [autodetect]
   --gdb=GDB-path           gdb to use for gdbstub tests [$gdb_bin]
   --wasm64-32bit-address-limit Restrict wasm64 address space to 32-bit (default
                                is to use the whole 64-bit range).
@@ -929,7 +913,6 @@ if ! check_py_version "$python"; then
   error_exit "Cannot use '$python', Python >= 3.9 is required." \
              "Use --python=/path/to/python to specify a supported Python." \
              "Maybe try:" \
-             "  openSUSE Leap 15.3+: zypper install python39" \
              "  CentOS: dnf install python3.12"
 fi
 
@@ -1183,12 +1166,12 @@ fi
 # detect rust triple
 
 meson_version=$($meson --version)
-if test "$rust" != disabled && ! version_ge "$meson_version" 1.10.0; then
+if test "$rust" != disabled && ! version_ge "$meson_version" 1.12.0; then
   if test "$rust" = enabled; then
     $mkvenv ensuregroup --dir "${source_path}/python/wheels" \
          ${source_path}/pythondeps.toml meson-rust || exit 1
   else
-    echo "Rust needs Meson 1.10.0, disabling" 2>&1
+    echo "Rust needs Meson 1.12.0, disabling" 2>&1
     rust=disabled
   fi
 fi
@@ -1247,11 +1230,6 @@ EOF
         rust_osvariant=${rust_osvariant}eabi
       fi
       ;;
-
-    mips64)
-      # e.g. mips64-unknown-linux-gnuabi64
-      rust_osvariant=${rust_osvariant}abi64
-      ;;
     esac
     ;;
 
@@ -1284,12 +1262,6 @@ EOF
     test "$rust_arch" = arm && test "$rust_os" != linux && rust_arch=armv7
     ;;
 
-  mips)
-    # preserve ISA version (mipsisa64r6 etc.) and include endianness
-    rust_arch=${raw_cpu%el}
-    test "$bigendian" = no && rust_arch=${rust_arch}el
-    ;;
-
   riscv64)
     # e.g. riscv64gc-unknown-linux-gnu, but riscv64-linux-android
     test "$android" = no && rust_arch=${rust_arch}gc
@@ -1319,12 +1291,12 @@ fi
 ##########################################
 # functions to probe cross compilers
 
-runc="no"
-if test $use_containers = "yes" && (has "docker" || has "podman"); then
-    runc=$($python "$source_path"/tests/docker/docker.py --engine "$container_engine" probe)
-    if test "$runc" != "no"; then
-        docker_py="$python $source_path/tests/docker/docker.py --engine $container_engine"
-    fi
+if test "$container_command" = ""; then
+    container_command=$($python "$source_path"/tests/docker/docker.py probe)
+    test "$container_command" = "no" && container_command=""
+fi
+if test $use_containers = "yes" && test "$container_command" != ""; then
+    docker_py="$python $source_path/tests/docker/docker.py --command $container_command"
 fi
 
 # cross compilers defaults, can be overridden with --cross-cc-ARCH
@@ -1443,7 +1415,7 @@ probe_target_compiler() {
   esac
 
   for host in $container_hosts; do
-    test "$runc" != no || continue
+    test "$container_command" != "" || continue
     test "$host" = "$cpu" || continue
     case $target_arch in
       # debian-all-test-cross architectures
@@ -1452,7 +1424,7 @@ probe_target_compiler() {
         container_image=debian-all-test-cross
         container_cross_prefix=aarch64-linux-gnu-
         ;;
-      alpha|hppa|m68k|mips|riscv64|sh4|sparc64)
+      alpha|hppa|m68k|mips|mipsel|riscv64|sh4|sparc64)
         container_image=debian-all-test-cross
         ;;
       mips64)
@@ -1528,7 +1500,6 @@ probe_target_compiler() {
         aarch64_be:aarch64 | \
         armeb:arm | \
         i386:x86_64 | \
-        mips*:mips64 | \
         ppc*:ppc64 | \
         sparc:sparc64 | \
         "$cpu:$cpu")
@@ -1765,14 +1736,10 @@ echo all: >> $config_host_mak
 echo "SRC_PATH=$source_path" >> $config_host_mak
 echo "TARGET_DIRS=$target_list" >> $config_host_mak
 echo "GDB=$gdb_bin" >> $config_host_mak
-if test "$runc" != no; then
-    echo "RUNC=$runc" >> $config_host_mak
-    echo "CONTAINER_ENGINE=$container_engine" >> $config_host_mak
+if test "$container_command" != ""; then
+    echo "CONTAINER_COMMAND=$container_command" >> $config_host_mak
 fi
 echo "SUBDIRS=$subdirs" >> $config_host_mak
-if test "$rust" != disabled; then
-  echo "RUST_TARGET_TRIPLE=$rust_target_triple" >> $config_host_mak
-fi
 echo "PYTHON=$python" >> $config_host_mak
 echo "MKVENV_ENSUREGROUP=$mkvenv ensuregroup $mkvenv_online_flag" >> $config_host_mak
 echo "GENISOIMAGE=$genisoimage" >> $config_host_mak
@@ -1880,6 +1847,7 @@ if test "$skip_meson" = no; then
   test -n "$objcc" && echo "objc_args = [$(meson_quote $OBJCFLAGS $EXTRA_OBJCFLAGS)]" >> $cross
   echo "c_link_args = [$(meson_quote $CFLAGS $LDFLAGS $EXTRA_CFLAGS $EXTRA_LDFLAGS)]" >> $cross
   echo "cpp_link_args = [$(meson_quote $CXXFLAGS $LDFLAGS $EXTRA_CXXFLAGS $EXTRA_LDFLAGS)]" >> $cross
+  test -n "$objcc" && echo "objc_link_args = [$(meson_quote $OBJCFLAGS $LDFLAGS $EXTRA_OBJCFLAGS $EXTRA_LDFLAGS)]" >> $cross
 
   # Only enable by default for git builds and on select OSes
   echo "# environment defaults, can still be overridden on " >> $cross

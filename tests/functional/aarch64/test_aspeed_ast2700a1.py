@@ -51,9 +51,11 @@ class AST2x00MachineSDK(QemuSystemTest):
         wait_for_console_pattern(self, 'pass')
         wait_for_console_pattern(self, 'Jumping to BL31 (Trusted Firmware-A)')
 
+    def disable_kernel_crypto_selftest(self):
+         exec_command_and_wait_for_pattern(self,
+            'setenv bootargs "${bootargs} cryptomgr.notests=1"', '=>')
+
     def enable_ast2700_pcie2(self):
-        wait_for_console_pattern(self, 'Hit any key to stop autoboot')
-        exec_command_and_wait_for_pattern(self, '\012', '=>')
         exec_command_and_wait_for_pattern(self,
             'cp 100420000 403000000 900000', '=>')
         exec_command_and_wait_for_pattern(self,
@@ -67,24 +69,29 @@ class AST2x00MachineSDK(QemuSystemTest):
 
     def verify_openbmc_boot_start(self, enable_pcie=True):
         wait_for_console_pattern(self, 'U-Boot 2023.10')
+        wait_for_console_pattern(self, 'Hit any key to stop autoboot')
+        exec_command_and_wait_for_pattern(self, '\012', '=>')
+        self.disable_kernel_crypto_selftest()
         if enable_pcie:
             self.enable_ast2700_pcie2()
+        else:
+            exec_command(self, 'boot')
         wait_for_console_pattern(self, 'Linux version ')
 
     def verify_openbmc_boot_and_login(self, name, enable_pcie=True):
         self.verify_openbmc_boot_start(enable_pcie)
 
-        wait_for_console_pattern(self, f'{name} login:')
+        wait_for_console_pattern(self, 'login:')
         exec_command_and_wait_for_pattern(self, 'root', 'Password:')
         exec_command_and_wait_for_pattern(self, '0penBmc', f'root@{name}:~#')
 
-    ASSET_SDK_V1101_AST2700A1 = Asset(
-            'https://github.com/AspeedTech-BMC/openbmc/releases/download/v11.01/ast2700-a1-image.tar.gz',
-            '859808828531a51931aad3b4e70b28143eebb3cde1838ba7d8e7a2b844c8a1ab')
+    ASSET_SDK_V1103_AST2700A1 = Asset(
+            'https://github.com/AspeedTech-BMC/openbmc/releases/download/v11.03/ast2700-a1-image.tar.gz',
+            '540961dc380709d852e957c5817cd7ee0dbb0a66f3aa17413eac7b67518afbfe')
 
-    ASSET_SDK_V1101_AST2700A1_DCSCM = Asset(
-            'https://github.com/AspeedTech-BMC/openbmc/releases/download/v11.01/ast2700-a1-dcscm-image.tar.gz',
-            '4654eabad75da3fd33635cd6d29b7635181daefee7294b68feb124b9d4c24116')
+    ASSET_SDK_V1103_AST2700A1_DCSCM = Asset(
+            'https://github.com/AspeedTech-BMC/openbmc/releases/download/v11.03/ast2700-a1-dcscm-image.tar.gz',
+            '5f7c139330fcefa6025bc7565a20fd5ea42cacebf810d56dc9a76b07cf69b3e1')
 
     def do_ast2700_i2c_test(self, bus_id):
         bus_str = str(bus_id)
@@ -111,6 +118,11 @@ class AST2x00MachineSDK(QemuSystemTest):
             'ip addr show dev eth2',
             'inet 10.0.2.15/24')
 
+    def do_ast2700_usb_ehci_test(self):
+        exec_command_and_wait_for_pattern(self,
+            'lsusb',
+            'QEMU QEMU USB Keyboard')
+
     def start_ast2700_test(self, name, bus_id):
         num_cpu = 4
         load_images_list = [
@@ -120,7 +132,8 @@ class AST2x00MachineSDK(QemuSystemTest):
             },
             {
                 'addr': '0x430000000',
-                'file': self.scratch_file(name, 'bl31.bin')
+                'file': self.scratch_file(name, 'trusted-firmware-a',
+                                          'bl31.bin')
             },
             {
                 'addr': '0x430080000',
@@ -147,34 +160,36 @@ class AST2x00MachineSDK(QemuSystemTest):
         self.do_test_aarch64_aspeed_sdk_start(
                 self.scratch_file(name, 'image-bmc'), bus_id)
 
-    def test_aarch64_ast2700a1_evb_sdk_v11_01(self):
+    def test_aarch64_ast2700a1_evb_sdk_v11_03(self):
         self.set_machine('ast2700a1-evb')
         self.require_netdev('user')
 
-        self.archive_extract(self.ASSET_SDK_V1101_AST2700A1)
+        self.archive_extract(self.ASSET_SDK_V1103_AST2700A1)
         self.vm.add_args('-device', 'e1000e,netdev=net1,bus=pcie.2')
         self.vm.add_args('-netdev', 'user,id=net1')
+        self.vm.add_args('-device', 'usb-kbd,bus=usb-bus.3')
         self.start_ast2700_test('ast2700-a1-image', 1)
         self.verify_openbmc_boot_and_login('ast2700-a1')
         self.do_ast2700_i2c_test(1)
         self.do_ast2700_pcie_test()
+        self.do_ast2700_usb_ehci_test()
 
-    def test_aarch64_ast2700a1_evb_sdk_vbootrom_v11_01(self):
+    def test_aarch64_ast2700a1_evb_sdk_vbootrom_v11_03(self):
         self.set_machine('ast2700a1-evb')
         self.require_netdev('user')
 
-        self.archive_extract(self.ASSET_SDK_V1101_AST2700A1)
+        self.archive_extract(self.ASSET_SDK_V1103_AST2700A1)
         self.vm.add_args('-device', 'e1000e,netdev=net1,bus=pcie.2')
         self.vm.add_args('-netdev', 'user,id=net1')
         self.start_ast2700_test_vbootrom('ast2700-a1-image', 1)
         self.verify_vbootrom_firmware_flow()
         self.verify_openbmc_boot_start()
 
-    def test_aarch64_ast2700a1_evb_ioexp_v11_01(self):
+    def test_aarch64_ast2700a1_evb_ioexp_v11_03(self):
         self.set_machine('ast2700a1-evb')
         self.require_netdev('user')
 
-        self.archive_extract(self.ASSET_SDK_V1101_AST2700A1_DCSCM)
+        self.archive_extract(self.ASSET_SDK_V1103_AST2700A1_DCSCM)
         self.vm.set_machine('ast2700a1-evb,fmc-model=w25q512jv')
         self.vm.add_args('-device',
                          'tmp105,bus=ioexp0.0,address=0x4d,id=tmp-test-16')

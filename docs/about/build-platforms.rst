@@ -114,7 +114,7 @@ Rust build dependencies
   bindgen tool, which is too big to package and distribute.  The minimum
   supported version of bindgen is 0.60.x.  For distributions that do not
   include bindgen or have an older version, it is recommended to install
-  a newer version using ``cargo install bindgen-cli``.
+  a newer version using ``cargo install --locked bindgen-cli``.
 
   QEMU requires Rust 1.83.0.  This is available on all supported platforms
   except for the ``mips64el`` architecture on Debian bookworm.  For all other
@@ -128,7 +128,7 @@ Rust build dependencies
 
   Some distros prefer to avoid vendored crate sources, and instead use
   local sources from e.g. ``/usr/share/cargo/registry``.  QEMU includes a
-  script, ``scripts/get-wraps-from-cargo-registry.py``, that automatically
+  script, ``scripts/update-cargo-wraps.py``, that automatically
   performs this task.  The script is meant to be invoked after unpacking
   the QEMU tarball.  QEMU also includes ``rust/Cargo.toml`` and
   ``rust/Cargo.lock`` files that can be used to compute QEMU's build

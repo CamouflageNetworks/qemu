@@ -241,7 +241,7 @@ static void dbus_update_gl_cb(GObject *source_object,
     }
 #endif
 
-    graphic_hw_gl_block(ddl->dcl.con, false);
+    qemu_console_hw_gl_block(ddl->dcl.con, false);
     g_object_unref(ddl);
 }
 #endif
@@ -257,7 +257,7 @@ static void dbus_call_update_gl(DisplayChangeListener *dcl,
 
     glFlush();
 #ifdef CONFIG_GBM
-    graphic_hw_gl_block(ddl->dcl.con, true);
+    qemu_console_hw_gl_block(ddl->dcl.con, true);
     qemu_dbus_display1_listener_call_update_dmabuf(ddl->proxy,
         x, y, w, h,
         G_DBUS_CALL_FLAGS_NONE,
@@ -276,7 +276,7 @@ static void dbus_call_update_gl(DisplayChangeListener *dcl,
         Error *err = NULL;
         assert(ddl->d3d_texture);
 
-        graphic_hw_gl_block(ddl->dcl.con, true);
+        qemu_console_hw_gl_block(ddl->dcl.con, true);
         if (!d3d_texture2d_release0(ddl->d3d_texture, &err)) {
             error_report_err(err);
             return;
@@ -660,6 +660,7 @@ static void dbus_cursor_dmabuf(DisplayChangeListener *dcl,
     egl_fb_setup_for_tex(&cursor_fb, width, height, texture, false);
     ds = qemu_create_displaysurface(width, height);
     egl_fb_read(ds, &cursor_fb);
+    egl_fb_destroy(&cursor_fb);
 
     v_data = g_variant_new_from_data(
         G_VARIANT_TYPE("ay"),
@@ -710,7 +711,7 @@ static void dbus_gl_refresh(DisplayChangeListener *dcl)
 {
     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
 
-    graphic_hw_update(dcl->con);
+    qemu_console_hw_update(dcl->con);
 
     if (!ddl->ds || qemu_console_is_gl_blocked(ddl->dcl.con)) {
         return;
@@ -739,7 +740,7 @@ static void dbus_gl_refresh(DisplayChangeListener *dcl)
 
 static void dbus_refresh(DisplayChangeListener *dcl)
 {
-    graphic_hw_update(dcl->con);
+    qemu_console_hw_update(dcl->con);
 }
 
 #ifdef CONFIG_OPENGL
@@ -956,7 +957,7 @@ dbus_display_listener_dispose(GObject *object)
 {
     DBusDisplayListener *ddl = DBUS_DISPLAY_LISTENER(object);
 
-    unregister_displaychangelistener(&ddl->dcl);
+    qemu_console_unregister_listener(&ddl->dcl);
     g_clear_object(&ddl->conn);
     g_clear_pointer(&ddl->bus_name, g_free);
     g_clear_object(&ddl->proxy);
@@ -978,27 +979,11 @@ dbus_display_listener_dispose(GObject *object)
 }
 
 static void
-dbus_display_listener_constructed(GObject *object)
-{
-    DBusDisplayListener *ddl = DBUS_DISPLAY_LISTENER(object);
-
-    ddl->dcl.ops = &dbus_dcl_ops;
-#ifdef CONFIG_OPENGL
-    if (display_opengl) {
-        ddl->dcl.ops = &dbus_gl_dcl_ops;
-    }
-#endif
-
-    G_OBJECT_CLASS(dbus_display_listener_parent_class)->constructed(object);
-}
-
-static void
 dbus_display_listener_class_init(DBusDisplayListenerClass *klass)
 {
     GObjectClass *object_class = G_OBJECT_CLASS(klass);
 
     object_class->dispose = dbus_display_listener_dispose;
-    object_class->constructed = dbus_display_listener_constructed;
 }
 
 static void
@@ -1025,9 +1010,11 @@ static bool
 dbus_display_listener_implements(DBusDisplayListener *ddl, const char *iface)
 {
     QemuDBusDisplay1Listener *l = QEMU_DBUS_DISPLAY1_LISTENER(ddl->proxy);
+    const char * const *interfaces;
     bool implements;
 
-    implements = g_strv_contains(qemu_dbus_display1_listener_get_interfaces(l), iface);
+    interfaces = qemu_dbus_display1_listener_get_interfaces(l);
+    implements = interfaces && g_strv_contains(interfaces, iface);
     if (!implements) {
         g_debug("Display listener does not implement: `%s`", iface);
     }
@@ -1180,6 +1167,20 @@ static void dbus_display_listener_setup_scanout_dmabuf_v2(DBusDisplayListener *d
 #endif
 }
 
+static void
+dbus_conn_closed(GDBusConnection *conn,
+                 gboolean remote_peer_vanished,
+                 GError *error,
+                 gpointer user_data)
+{
+    DBusDisplayListener *ddl = DBUS_DISPLAY_LISTENER(user_data);
+
+    if (ddl->dbus_filter) {
+        g_dbus_connection_remove_filter(ddl->conn, ddl->dbus_filter);
+        ddl->dbus_filter = 0;
+    }
+}
+
 static GDBusMessage *
 dbus_filter(GDBusConnection *connection,
             GDBusMessage    *message,
@@ -1241,6 +1242,7 @@ dbus_display_listener_new(const char *bus_name,
                           GDBusConnection *conn,
                           DBusDisplayConsole *console)
 {
+    const DisplayChangeListenerOps *ops = &dbus_dcl_ops;
     DBusDisplayListener *ddl;
     QemuConsole *con;
     g_autoptr(GError) err = NULL;
@@ -1261,6 +1263,7 @@ dbus_display_listener_new(const char *bus_name,
     }
 
     ddl->dbus_filter = g_dbus_connection_add_filter(conn, dbus_filter, g_object_ref(ddl), g_object_unref);
+    g_signal_connect(conn, "closed", G_CALLBACK(dbus_conn_closed), ddl);
     ddl->bus_name = g_strdup(bus_name);
     ddl->conn = conn;
     ddl->console = console;
@@ -1272,8 +1275,12 @@ dbus_display_listener_new(const char *bus_name,
 
     con = qemu_console_lookup_by_index(dbus_display_console_get_index(console));
     assert(con);
-    ddl->dcl.con = con;
-    register_displaychangelistener(&ddl->dcl);
+#ifdef CONFIG_OPENGL
+    if (display_opengl) {
+        ops = &dbus_gl_dcl_ops;
+    }
+#endif
+    qemu_console_register_listener(con, &ddl->dcl, ops);
 
     return ddl;
 }

@@ -26,7 +26,7 @@
 #include "qemu/guest-random.h"
 #include "exec/target_page.h"
 #include "system/system.h"
-#include "cpu.h"
+#include "target/m68k/cpu.h"
 #include "hw/core/boards.h"
 #include "hw/core/or-irq.h"
 #include "elf.h"
@@ -633,7 +633,7 @@ static void q800_machine_init(MachineState *machine)
 
             initrd_base = (ram_size - initrd_size) & TARGET_PAGE_MASK;
             load_image_targphys(initrd_filename, initrd_base,
-                                ram_size - initrd_base, NULL);
+                                ram_size - initrd_base, &error_fatal);
             BOOTINFO2(param_ptr, BI_RAMDISK, initrd_base,
                       initrd_size);
         } else {
@@ -710,12 +710,14 @@ static void q800_init(Object *obj)
 
 static GlobalProperty hw_compat_q800[] = {
     { "scsi-hd", "quirk_mode_page_vendor_specific_apple", "on" },
+    { "scsi-hd", "quirk_mode_page_set_block_size", "on" },
     { "scsi-hd", "vendor", " SEAGATE" },
     { "scsi-hd", "product", "          ST225N" },
     { "scsi-hd", "ver", "1.0 " },
     { "scsi-cd", "quirk_mode_page_apple_vendor", "on" },
     { "scsi-cd", "quirk_mode_sense_rom_use_dbd", "on" },
     { "scsi-cd", "quirk_mode_page_vendor_specific_apple", "on" },
+    { "scsi-cd", "quirk_mode_page_set_block_size", "on" },
     { "scsi-cd", "quirk_mode_page_truncated", "on" },
     { "scsi-cd", "vendor", "MATSHITA" },
     { "scsi-cd", "product", "CD-ROM CR-8005" },

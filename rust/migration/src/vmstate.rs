@@ -11,8 +11,7 @@
 //!   migration format for a struct.  This is based on the [`VMState`] trait,
 //!   which is defined by all migratable types.
 //!
-//! * [`impl_vmstate_forward`](crate::impl_vmstate_forward),
-//!   [`impl_vmstate_bitsized`](crate::impl_vmstate_bitsized), and
+//! * [`impl_vmstate_forward`](crate::impl_vmstate_forward) and
 //!   [`impl_vmstate_struct`](crate::impl_vmstate_struct), which help with the
 //!   definition of the [`VMState`] trait (respectively for transparent structs,
 //!   nested structs and `bilge`-defined types)
@@ -90,7 +89,7 @@ macro_rules! call_func_with_field {
 /// The contents of this trait go straight into structs that are parsed by C
 /// code and used to introspect into other structs.  Generally, you don't need
 /// to implement it except via macros that do it for you, such as
-/// `impl_vmstate_bitsized!`.
+/// `impl_vmstate_forward!`.
 pub unsafe trait VMState {
     /// The base contents of a `VMStateField` (minus the name and offset) for
     /// the type that is implementing the trait.
@@ -133,9 +132,8 @@ pub const fn vmstate_varray_flag<T: VMState>(_: PhantomData<T>) -> VMStateFlags 
 /// * an array of any of the above
 ///
 /// In order to support other types, the trait `VMState` must be implemented
-/// for them.  The macros [`impl_vmstate_forward`](crate::impl_vmstate_forward),
-/// [`impl_vmstate_bitsized`](crate::impl_vmstate_bitsized), and
-/// [`impl_vmstate_struct`](crate::impl_vmstate_struct) help with this.
+/// for them.  The macros [`impl_vmstate_forward`](crate::impl_vmstate_forward)
+/// and [`impl_vmstate_struct`](crate::impl_vmstate_struct) help with this.
 ///
 /// [`BqlCell`]: ../../bql/cell/struct.BqlCell.html
 /// [`BqlRefCell`]: ../../bql/cell/struct.BqlRefCell.html
@@ -159,8 +157,7 @@ macro_rules! vmstate_of {
             )$(.with_varray_flag($crate::call_func_with_field!(
                     $crate::vmstate::vmstate_varray_flag,
                     $struct_name,
-                    $($num).+))
-               $(.with_varray_multiply($factor))?)?
+                    $($num).+)))?
         }
     };
 }
@@ -211,41 +208,6 @@ impl_vmstate_transparent!(std::cell::UnsafeCell<T> where T: VMState);
 impl_vmstate_transparent!(std::pin::Pin<T> where T: VMState);
 impl_vmstate_transparent!(common::Opaque<T> where T: VMState);
 impl_vmstate_transparent!(std::mem::ManuallyDrop<T> where T: VMState);
-
-#[macro_export]
-macro_rules! impl_vmstate_bitsized {
-    ($type:ty) => {
-        unsafe impl $crate::vmstate::VMState for $type {
-            const BASE: $crate::bindings::VMStateField =
-                                        <<<$type as ::bilge::prelude::Bitsized>::ArbitraryInt
-                                          as ::bilge::prelude::Number>::UnderlyingType
-                                         as $crate::vmstate::VMState>::BASE;
-            const VARRAY_FLAG: $crate::bindings::VMStateFlags =
-                                        <<<$type as ::bilge::prelude::Bitsized>::ArbitraryInt
-                                          as ::bilge::prelude::Number>::UnderlyingType
-                                         as $crate::vmstate::VMState>::VARRAY_FLAG;
-        }
-
-        impl $crate::migratable::ToMigrationState for $type {
-            type Migrated = <<$type as ::bilge::prelude::Bitsized>::ArbitraryInt
-                                          as ::bilge::prelude::Number>::UnderlyingType;
-
-            fn snapshot_migration_state(&self, target: &mut Self::Migrated) -> Result<(), $crate::InvalidError> {
-                *target = Self::Migrated::from(*self);
-                Ok(())
-            }
-
-            fn restore_migrated_state_mut(
-                &mut self,
-                source: Self::Migrated,
-                version_id: u8,
-            ) -> Result<(), $crate::InvalidError> {
-                *self = Self::from(source);
-                Ok(())
-            }
-        }
-    };
-}
 
 // Scalar types using predefined VMStateInfos
 
@@ -492,6 +454,11 @@ unsafe extern "C" fn vmstate_no_version_cb<
     into_neg_errno(result)
 }
 
+unsafe extern "C" fn vmstate_post_save_cb<T, F: for<'a> FnCall<(&'a T,), ()>>(opaque: *mut c_void) {
+    // SAFETY: the function is used in T's implementation of VMState.
+    F::call((unsafe { &*(opaque.cast::<T>()) },));
+}
+
 unsafe extern "C" fn vmstate_post_load_cb<
     T,
     F: for<'a> FnCall<(&'a T, u8), Result<(), impl Into<Errno>>>,
@@ -597,12 +564,9 @@ impl<T> VMStateDescriptionBuilder<T> {
     }
 
     #[must_use]
-    pub const fn post_save<F: for<'a> FnCall<(&'a T,), Result<(), impl Into<Errno>>>>(
-        mut self,
-        _f: &F,
-    ) -> Self {
+    pub const fn post_save<F: for<'a> FnCall<(&'a T,), ()>>(mut self, _f: &F) -> Self {
         self.0.post_save = if F::IS_SOME {
-            Some(vmstate_no_version_cb::<T, F>)
+            Some(vmstate_post_save_cb::<T, F>)
         } else {
             None
         };
