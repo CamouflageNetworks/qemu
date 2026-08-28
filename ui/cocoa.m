@@ -51,6 +51,7 @@
 #include "qemu/error-report.h"
 #include <Carbon/Carbon.h>
 #include "hw/core/cpu.h"
+#include "hw/core/boards.h"
 
 #ifndef MAC_OS_VERSION_14_0
 #define MAC_OS_VERSION_14_0 140000
@@ -252,6 +253,10 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         [self setClipsToBounds:YES];
 #endif
         [self setWantsLayer:YES];
+        /* Use CALayer-based rendering instead of drawRect: for flicker-free
+         * GPU-composited scaling when zoom-to-fit is enabled. */
+        [[self layer] setContentsGravity:kCAGravityResize];
+        [[self layer] setBackgroundColor:CGColorGetConstantColor(kCGColorBlack)];
         cursorLayer = [[CALayer alloc] init];
         [cursorLayer setAnchorPoint:CGPointMake(0, 1)];
         [cursorLayer setAutoresizingMask:kCALayerMaxXMargin |
@@ -283,6 +288,58 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (BOOL) isOpaque
 {
     return YES;
+}
+
+- (BOOL) wantsUpdateLayer
+{
+    return YES;
+}
+
+- (void) updateLayer
+{
+    if (!pixman_image) {
+        [self.layer setContents:nil];
+        return;
+    }
+
+    int w = pixman_image_get_width(pixman_image);
+    int h = pixman_image_get_height(pixman_image);
+    int bitsPerPixel = PIXMAN_FORMAT_BPP(pixman_image_get_format(pixman_image));
+    int stride = pixman_image_get_stride(pixman_image);
+    CGDataProviderRef dataProviderRef = CGDataProviderCreateWithData(
+        NULL,
+        pixman_image_get_data(pixman_image),
+        stride * h,
+        NULL
+    );
+    CGImageRef imageRef = CGImageCreate(
+        w,
+        h,
+        DIV_ROUND_UP(bitsPerPixel, 8) * 2,
+        bitsPerPixel,
+        stride,
+        colorspace,
+        kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+        dataProviderRef,
+        NULL,
+        0,
+        kCGRenderingIntentDefault
+    );
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [self.layer setContents:(id)imageRef];
+    if (zoom_interpolation == kCGInterpolationNone) {
+        [self.layer setMagnificationFilter:kCAFilterNearest];
+        [self.layer setMinificationFilter:kCAFilterNearest];
+    } else {
+        [self.layer setMagnificationFilter:kCAFilterLinear];
+        [self.layer setMinificationFilter:kCAFilterLinear];
+    }
+    [CATransaction commit];
+
+    CGImageRelease(imageRef);
+    CGDataProviderRelease(dataProviderRef);
 }
 
 - (void) viewDidMoveToWindow
@@ -497,8 +554,6 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
 - (void) resizeWindow
 {
-    [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
-
     if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
         CGFloat width = screen.width / [[self window] backingScaleFactor];
         CGFloat height = screen.height / [[self window] backingScaleFactor];
@@ -506,16 +561,27 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         [[self window] setContentSize:NSMakeSize(width, height)];
         [[self window] center];
     } else if ([[self window] styleMask] & NSWindowStyleMaskFullScreen) {
-        [[self window] setContentSize:[self fixAspectRatio:[self screenSafeAreaSize]]];
-        [[self window] center];
+        /* In fullscreen, Auto Layout fills the available space */
     } else {
-        [[self window] setContentSize:[self fixAspectRatio:[self frame].size]];
+        NSSize currentSize = [self frame].size;
+        /* If the view is smaller than the guest resolution (e.g. initial
+         * 640x480 frame), scale up to fill ~75% of the screen. */
+        if (currentSize.width < screen.width || currentSize.height < screen.height) {
+            NSSize safeArea = [self screenSafeAreaSize];
+            NSSize vmTarget = [self fixAspectRatio:NSMakeSize(safeArea.width * 0.75, safeArea.height * 0.75)];
+            /* Measure chrome overhead (titlebar + toolbar + stats bar + separators) */
+            CGFloat chromeH = [[self window] frame].size.height - currentSize.height;
+            [[self window] setFrame:NSMakeRect(0, 0, vmTarget.width, vmTarget.height + chromeH)
+                            display:YES];
+            [[self window] center];
+        }
     }
 }
 
 - (void) updateBounds
 {
-    [self setBoundsSize:NSMakeSize(screen.width, screen.height)];
+    /* With CALayer-based rendering, the layer handles scaling via
+     * contentsGravity. No need to remap the view's coordinate space. */
 }
 
 #pragma clang diagnostic push
@@ -561,8 +627,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
     info.xoff = 0;
     info.yoff = 0;
-    info.width = frameSize.width * [[self window] backingScaleFactor];
-    info.height = frameSize.height * [[self window] backingScaleFactor];
+    // Report the larger of the view size and the current guest framebuffer.
+    // This prevents the guest from downscaling when the window is smaller
+    // than the configured resolution (zoom-to-fit scales on the host side).
+    info.width = MAX(frameSize.width, screen.width);
+    info.height = MAX(frameSize.height, screen.height);
 
     qemu_console_set_ui_info(dcl.con, &info, TRUE);
 }
@@ -970,12 +1039,17 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
     with_bql(^{
         if (isAbsoluteEnabled) {
-            CGFloat d = (CGFloat)screen.height / [self frame].size.height;
-            NSPoint p = [event locationInWindow];
+            /* Convert window coordinates to view-local coordinates */
+            NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
+            NSSize viewSize = [self frame].size;
+
+            /* Map view coordinates to guest framebuffer coordinates */
+            CGFloat scaleX = (CGFloat)screen.width / viewSize.width;
+            CGFloat scaleY = (CGFloat)screen.height / viewSize.height;
 
             /* Note that the origin for Cocoa mouse coords is bottom left, not top left. */
-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x * d, 0, screen.width);
-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - p.y * d, 0, screen.height);
+            qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x * scaleX, 0, screen.width);
+            qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - p.y * scaleY, 0, screen.height);
         } else {
             qemu_input_queue_rel(dcl.con, INPUT_AXIS_X, [event deltaX]);
             qemu_input_queue_rel(dcl.con, INPUT_AXIS_Y, [event deltaY]);
@@ -983,6 +1057,12 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
         qemu_input_event_sync();
     });
+}
+
+- (void) scrollWheel:(NSEvent *)event
+{
+    /* Consume scroll events to prevent macOS overlay scroll indicators.
+     * Do not call super — just swallow the event. */
 }
 
 - (void) mouseExited:(NSEvent *)event
@@ -1058,9 +1138,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     COCOA_DEBUG("QemuCocoaView: grabMouse\n");
 
     if (qemu_name)
-        [[self window] setTitle:[NSString stringWithFormat:@"QEMU %s - (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)", qemu_name]];
+        [[self window] setTitle:[NSString stringWithFormat:@"MacVirt — %s (" UC_CTRL_KEY UC_ALT_KEY "G to release mouse)", qemu_name]];
     else
-        [[self window] setTitle:@"QEMU - (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)"];
+        [[self window] setTitle:@"MacVirt (" UC_CTRL_KEY UC_ALT_KEY "G to release mouse)"];
     [self hideCursor];
     CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
     isMouseGrabbed = TRUE; // while isMouseGrabbed = TRUE, QemuCocoaApp sends all events to [cocoaView handleEvent:]
@@ -1071,9 +1151,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     COCOA_DEBUG("QemuCocoaView: ungrabMouse\n");
 
     if (qemu_name)
-        [[self window] setTitle:[NSString stringWithFormat:@"QEMU %s", qemu_name]];
+        [[self window] setTitle:[NSString stringWithFormat:@"MacVirt — %s", qemu_name]];
     else
-        [[self window] setTitle:@"QEMU"];
+        [[self window] setTitle:@"MacVirt"];
     [self unhideCursor];
     CGAssociateMouseAndMouseCursorPosition(TRUE);
     isMouseGrabbed = FALSE;
@@ -1131,9 +1211,23 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     QemuCocoaAppController
  ------------------------------------------------------
 */
+static NSToolbarItemIdentifier const MacVirtToolbarShutdownItem = @"macvirt.toolbar.shutdown";
+static NSToolbarItemIdentifier const MacVirtToolbarPowerItem    = @"macvirt.toolbar.power";
+
 @interface QemuCocoaAppController : NSObject
-                                       <NSWindowDelegate, NSApplicationDelegate>
+                                       <NSWindowDelegate, NSApplicationDelegate, NSToolbarDelegate>
 {
+    NSTextField *stateLabel;
+    NSTextField *uptimeLabel;
+    NSTextField *cpuLabel;
+    NSTextField *memLabel;
+    NSTimer *uptimeTimer;
+    NSDate *startTime;
+    NSStackView *statsBar;
+    NSBox *statsBarSeparator;
+    NSLayoutConstraint *vmBottomToSeparator;
+    NSLayoutConstraint *vmBottomToContent;
+    NSArray *statsBarConstraints;
 }
 - (void)doToggleFullScreen:(id)sender;
 - (void)showQEMUDoc:(id)sender;
@@ -1172,16 +1266,127 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
         // create a window
         window = [[NSWindow alloc] initWithContentRect:[cocoaView frame]
-            styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskClosable
+            styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskClosable|NSWindowStyleMaskResizable|NSWindowStyleMaskFullSizeContentView
             backing:NSBackingStoreBuffered defer:NO];
         if(!window) {
             error_report("(cocoa) can't create window");
             exit(1);
         }
         [window setAcceptsMouseMovedEvents:YES];
-        [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
-        [window setTitle:qemu_name ? [NSString stringWithFormat:@"QEMU %s", qemu_name] : @"QEMU"];
-        [window setContentView:cocoaView];
+        [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary |
+                                       NSWindowCollectionBehaviorMoveToActiveSpace];
+        [window setTitle:qemu_name ? [NSString stringWithFormat:@"MacVirt — %s", qemu_name] : @"MacVirt"];
+        [window setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+        [window setTitlebarAppearsTransparent:YES];
+        [window setTitleVisibility:NSWindowTitleVisible];
+        [window setBackgroundColor:[NSColor colorWithWhite:0.11 alpha:1.0]];
+        [window setMinSize:NSMakeSize(400, 300)];
+        [window setTitlebarSeparatorStyle:NSTitlebarSeparatorStyleAutomatic];
+
+        /* ── Toolbar ── */
+        NSToolbar *toolbar = [[NSToolbar alloc] initWithIdentifier:@"macvirt.toolbar"];
+        toolbar.delegate = self;
+        toolbar.displayMode = NSToolbarDisplayModeIconOnly;
+        [window setToolbar:toolbar];
+
+        /* ── Stats bar (bottom) ── */
+        NSTextField *(^makeStatLabel)(NSString *) = ^NSTextField *(NSString *text) {
+            NSTextField *label = [NSTextField labelWithString:text];
+            label.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+            label.textColor = [NSColor secondaryLabelColor];
+            label.translatesAutoresizingMaskIntoConstraints = NO;
+            return label;
+        };
+
+        stateLabel = makeStatLabel(@"\u25CF Running");
+        stateLabel.textColor = [NSColor systemGreenColor];
+
+        uptimeLabel = makeStatLabel(@"Uptime: 00:00:00");
+
+        /* Read CPU/memory from machine config */
+        unsigned int numCpus = current_machine ? current_machine->smp.cpus : 0;
+        unsigned long memMB = current_machine ? (unsigned long)(current_machine->ram_size / (1024 * 1024)) : 0;
+
+        cpuLabel = makeStatLabel([NSString stringWithFormat:@"CPU: %u cores", numCpus]);
+        memLabel = makeStatLabel([NSString stringWithFormat:@"Memory: %lu MB", memMB]);
+
+        NSTextField *urlLabel = makeStatLabel(@"https://www.macvirt.com");
+        urlLabel.textColor = [NSColor whiteColor];
+
+        NSTextField *dotLabel = makeStatLabel(@"\u2759");
+        dotLabel.textColor = [NSColor colorWithWhite:0.8 alpha:1.0];
+
+        NSTextField *copyrightLabel = makeStatLabel(@"\u00A9 2026 Camouflage Networks, Inc.");
+        copyrightLabel.textColor = [NSColor colorWithWhite:0.5 alpha:1.0];
+
+        NSStackView *leftStack = [NSStackView stackViewWithViews:@[
+            stateLabel, uptimeLabel, cpuLabel, memLabel
+        ]];
+        leftStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+        leftStack.spacing = 16;
+
+        NSStackView *rightStack = [NSStackView stackViewWithViews:@[
+            urlLabel, dotLabel, copyrightLabel
+        ]];
+        rightStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+        rightStack.spacing = 6;
+
+        NSView *spacer = [[NSView alloc] init];
+        spacer.translatesAutoresizingMaskIntoConstraints = NO;
+        [spacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+
+        statsBar = [NSStackView stackViewWithViews:@[
+            leftStack, spacer, rightStack
+        ]];
+        statsBar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+        statsBar.spacing = 8;
+        statsBar.alignment = NSLayoutAttributeCenterY;
+        statsBar.translatesAutoresizingMaskIntoConstraints = NO;
+        statsBar.edgeInsets = NSEdgeInsetsMake(0, 12, 0, 12);
+
+        statsBarSeparator = [[NSBox alloc] init];
+        statsBarSeparator.boxType = NSBoxSeparator;
+        statsBarSeparator.translatesAutoresizingMaskIntoConstraints = NO;
+
+        /* ── Root content view ── */
+        NSView *contentView = [[NSView alloc] init];
+        cocoaView.translatesAutoresizingMaskIntoConstraints = NO;
+        [contentView addSubview:cocoaView];
+        [contentView addSubview:statsBarSeparator];
+        [contentView addSubview:statsBar];
+
+        CGFloat barH = 28.0;
+        NSLayoutGuide *safe = contentView.safeAreaLayoutGuide;
+
+        /* VM bottom constraint: normally to separator, in fullscreen to content bottom */
+        vmBottomToSeparator = [[cocoaView.bottomAnchor constraintEqualToAnchor:statsBarSeparator.topAnchor] retain];
+        vmBottomToContent = [[cocoaView.bottomAnchor constraintEqualToAnchor:contentView.bottomAnchor] retain];
+        vmBottomToContent.active = NO;
+
+        statsBarConstraints = [@[
+            vmBottomToSeparator,
+            [statsBarSeparator.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor],
+            [statsBarSeparator.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor],
+            [statsBarSeparator.bottomAnchor constraintEqualToAnchor:statsBar.topAnchor constant:-2],
+            [statsBar.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor],
+            [statsBar.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor],
+            [statsBar.bottomAnchor constraintEqualToAnchor:contentView.bottomAnchor],
+            [statsBar.heightAnchor constraintEqualToConstant:barH],
+        ] retain];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [cocoaView.topAnchor constraintEqualToAnchor:safe.topAnchor],
+            [cocoaView.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor],
+            [cocoaView.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor],
+        ]];
+        [NSLayoutConstraint activateConstraints:statsBarConstraints];
+
+        [window setContentView:contentView];
+
+        /* ── Uptime timer ── */
+        startTime = [[NSDate date] retain];
+        uptimeTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+            target:self selector:@selector(updateUptime:) userInfo:nil repeats:YES];
         [window makeKeyAndOrderFront:self];
         [window center];
         [window setDelegate: self];
@@ -1205,9 +1410,84 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaAppController: dealloc\n");
 
+    [uptimeTimer invalidate];
+    [startTime release];
+    [statsBarConstraints release];
+    [vmBottomToSeparator release];
+    [vmBottomToContent release];
     [cocoaView release];
 
     [super dealloc];
+}
+
+- (void)updateUptime:(NSTimer *)timer
+{
+    NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:startTime];
+    int hrs = (int)(elapsed / 3600);
+    int mins = (int)((int)elapsed % 3600) / 60;
+    int secs = (int)elapsed % 60;
+    uptimeLabel.stringValue = [NSString stringWithFormat:@"Uptime: %02d:%02d:%02d", hrs, mins, secs];
+}
+
+#pragma mark - NSToolbarDelegate
+
+- (NSToolbarItem *)toolbar:(NSToolbar *)toolbar
+     itemForItemIdentifier:(NSToolbarItemIdentifier)itemIdentifier
+ willBeInsertedIntoToolbar:(BOOL)flag
+{
+    NSToolbarItem *item = [[NSToolbarItem alloc] initWithItemIdentifier:itemIdentifier];
+
+    if ([itemIdentifier isEqualToString:MacVirtToolbarShutdownItem]) {
+        NSButton *btn = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"power"
+                                                    accessibilityDescription:@"Shut Down"]
+                                           target:self
+                                           action:@selector(powerDownQEMU:)];
+        btn.bordered = YES;
+        btn.bezelStyle = NSBezelStyleAccessoryBarAction;
+        btn.showsBorderOnlyWhileMouseInside = YES;
+        btn.contentTintColor = [NSColor whiteColor];
+        item.view = btn;
+        item.label = @"Shut Down";
+        item.toolTip = @"Graceful ACPI shutdown";
+    }
+    else if ([itemIdentifier isEqualToString:MacVirtToolbarPowerItem]) {
+        NSButton *btn = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"stop.fill"
+                                                    accessibilityDescription:@"Power Off"]
+                                           target:self
+                                           action:@selector(forceQuit:)];
+        btn.bordered = YES;
+        btn.bezelStyle = NSBezelStyleAccessoryBarAction;
+        btn.showsBorderOnlyWhileMouseInside = YES;
+        btn.contentTintColor = [NSColor whiteColor];
+        item.view = btn;
+        item.label = @"Power Off";
+        item.toolTip = @"Force power off";
+    }
+
+    return [item autorelease];
+}
+
+- (NSArray<NSToolbarItemIdentifier> *)toolbarDefaultItemIdentifiers:(NSToolbar *)toolbar
+{
+    return @[
+        NSToolbarFlexibleSpaceItemIdentifier,
+        MacVirtToolbarShutdownItem,
+        MacVirtToolbarPowerItem,
+    ];
+}
+
+- (NSArray<NSToolbarItemIdentifier> *)toolbarAllowedItemIdentifiers:(NSToolbar *)toolbar
+{
+    return @[
+        MacVirtToolbarShutdownItem,
+        MacVirtToolbarPowerItem,
+        NSToolbarFlexibleSpaceItemIdentifier,
+    ];
+}
+
+- (void)forceQuit:(id)sender
+{
+    [NSApp terminate:nil];
 }
 
 - (void)applicationDidFinishLaunching: (NSNotification *) note
@@ -1250,15 +1530,71 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     [cocoaView updateUIInfo];
 }
 
+- (NSSize)windowWillResize:(NSWindow *)sender toSize:(NSSize)frameSize
+{
+    QEMUScreen guestScreen = [cocoaView gscreen];
+    if (guestScreen.width <= 0 || guestScreen.height <= 0) {
+        return frameSize;
+    }
+
+    /* Measure actual overhead: difference between window frame and VM view.
+     * This accounts for titlebar, toolbar, stats bar, separators — everything. */
+    CGFloat vmViewW = cocoaView.frame.size.width;
+    CGFloat vmViewH = cocoaView.frame.size.height;
+    CGFloat overheadW = sender.frame.size.width - vmViewW;
+    CGFloat overheadH = sender.frame.size.height - vmViewH;
+
+    /* New VM view area after subtracting all chrome */
+    CGFloat newVmW = frameSize.width - overheadW;
+    CGFloat newVmH = frameSize.height - overheadH;
+    if (newVmW < 100) newVmW = 100;
+    if (newVmH < 100) newVmH = 100;
+
+    /* Enforce guest framebuffer aspect ratio */
+    CGFloat aspect = (CGFloat)guestScreen.width / (CGFloat)guestScreen.height;
+    CGFloat fitH = newVmW / aspect;
+
+    if (fitH <= newVmH) {
+        frameSize.height = fitH + overheadH;
+    } else {
+        frameSize.width = newVmH * aspect + overheadW;
+    }
+
+    return frameSize;
+}
+
 - (void)windowDidEnterFullScreen:(NSNotification *)notification
 {
-    [cocoaView grabMouse];
+    /* Hide stats bar and toolbar for clean immersive fullscreen */
+    [NSLayoutConstraint deactivateConstraints:statsBarConstraints];
+    vmBottomToContent.active = YES;
+    [statsBar setHidden:YES];
+    [statsBarSeparator setHidden:YES];
+    [[[cocoaView window] toolbar] setVisible:NO];
+}
+
+- (void)windowWillExitFullScreen:(NSNotification *)notification
+{
+    /* Restore stats bar and toolbar before exit animation */
+    vmBottomToContent.active = NO;
+    [NSLayoutConstraint activateConstraints:statsBarConstraints];
+    [statsBar setHidden:NO];
+    [statsBarSeparator setHidden:NO];
+    [[[cocoaView window] toolbar] setVisible:YES];
 }
 
 - (void)windowDidExitFullScreen:(NSNotification *)notification
 {
+    /* Re-apply window chrome styling — macOS fullscreen transition can reset these */
+    NSWindow *w = [cocoaView window];
+    [w setTitlebarAppearsTransparent:YES];
+    [w setTitleVisibility:NSWindowTitleVisible];
+    [w setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+    [w setBackgroundColor:[NSColor colorWithWhite:0.11 alpha:1.0]];
+    [w setTitlebarSeparatorStyle:NSTitlebarSeparatorStyleAutomatic];
+    [[w toolbar] setVisible:YES];
+
     [cocoaView resizeWindow];
-    [cocoaView ungrabMouse];
 }
 
 - (void)windowDidResize:(NSNotification *)notification
@@ -1271,22 +1607,38 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (BOOL)windowShouldClose:(id)sender
 {
     COCOA_DEBUG("QemuCocoaAppController: windowShouldClose\n");
-    [NSApp terminate: sender];
-    /* If the user allows the application to quit then the call to
-     * NSApp terminate will never return. If we get here then the user
-     * cancelled the quit, so we should return NO to not permit the
-     * closing of this window.
-     */
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"What would you like to do?";
+    alert.informativeText = @"The VM is still running. Choose how to handle it.";
+    alert.alertStyle = NSAlertStyleInformational;
+
+    [alert addButtonWithTitle:@"Shut Down"];        /* NSAlertFirstButtonReturn  */
+    [alert addButtonWithTitle:@"Force Power Off"];  /* NSAlertSecondButtonReturn */
+    [alert addButtonWithTitle:@"Cancel"];            /* NSAlertThirdButtonReturn  */
+
+    alert.buttons[1].hasDestructiveAction = YES;
+    alert.buttons[2].keyEquivalent = @"\033"; /* Escape = Cancel */
+
+    [alert beginSheetModalForWindow:sender completionHandler:^(NSModalResponse response) {
+        if (response == NSAlertFirstButtonReturn) {
+            /* Graceful ACPI shutdown — guest OS handles it */
+            with_bql(^{
+                qmp_system_powerdown(NULL);
+            });
+        } else if (response == NSAlertSecondButtonReturn) {
+            /* Hard power off */
+            [NSApp terminate:nil];
+        }
+        /* Cancel — do nothing */
+    }];
+    [alert release];
+
     return NO;
 }
 
-- (NSApplicationPresentationOptions) window:(NSWindow *)window
-                                     willUseFullScreenPresentationOptions:(NSApplicationPresentationOptions)proposedOptions;
-
-{
-    return (proposedOptions & ~(NSApplicationPresentationAutoHideDock | NSApplicationPresentationAutoHideMenuBar)) |
-           NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar;
-}
+/* Use default macOS fullscreen presentation — auto-hide dock and menubar,
+ * revealed when the mouse moves to the edge of the screen. */
 
 /*
  * Called when QEMU goes into the background. Note that
@@ -1524,7 +1876,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     NSString *icon_path = [NSString stringWithUTF8String:icon_path_c];
     g_free(icon_path_c);
     NSImage *icon = [[NSImage alloc] initWithContentsOfFile:icon_path];
-    NSString *version = @"QEMU emulator version " QEMU_FULL_VERSION;
+    NSString *version = @"MacVirt (QEMU " QEMU_FULL_VERSION ")";
     NSString *copyright = @QEMU_COPYRIGHT;
     NSDictionary *options;
     if (icon) {
@@ -1600,17 +1952,17 @@ static void create_initial_menus(void)
 
     // Application menu
     menu = [[NSMenu alloc] initWithTitle:@""];
-    [menu addItemWithTitle:@"About QEMU" action:@selector(do_about_menu_item:) keyEquivalent:@""]; // About QEMU
+    [menu addItemWithTitle:@"About MacVirt" action:@selector(do_about_menu_item:) keyEquivalent:@""]; // About MacVirt
     [menu addItem:[NSMenuItem separatorItem]]; //Separator
     menuItem = [menu addItemWithTitle:@"Services" action:nil keyEquivalent:@""];
     [menuItem setSubmenu:[NSApp servicesMenu]];
     [menu addItem:[NSMenuItem separatorItem]];
-    [menu addItemWithTitle:@"Hide QEMU" action:@selector(hide:) keyEquivalent:@"h"]; //Hide QEMU
+    [menu addItemWithTitle:@"Hide MacVirt" action:@selector(hide:) keyEquivalent:@"h"]; //Hide MacVirt
     menuItem = (NSMenuItem *)[menu addItemWithTitle:@"Hide Others" action:@selector(hideOtherApplications:) keyEquivalent:@"h"]; // Hide Others
     [menuItem setKeyEquivalentModifierMask:(NSEventModifierFlagOption|NSEventModifierFlagCommand)];
     [menu addItemWithTitle:@"Show All" action:@selector(unhideAllApplications:) keyEquivalent:@""]; // Show All
     [menu addItem:[NSMenuItem separatorItem]]; //Separator
-    [menu addItemWithTitle:@"Quit QEMU" action:@selector(terminate:) keyEquivalent:@"q"];
+    [menu addItemWithTitle:@"Quit MacVirt" action:@selector(terminate:) keyEquivalent:@"q"];
     menuItem = [[NSMenuItem alloc] initWithTitle:@"Apple" action:nil keyEquivalent:@""];
     [menuItem setSubmenu:menu];
     [[NSApp mainMenu] addItem:menuItem];
@@ -1902,8 +2254,7 @@ static void cocoa_update(DisplayChangeListener *dcl,
     COCOA_DEBUG("qemu_cocoa: cocoa_update\n");
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSRect rect = NSMakeRect(x, [cocoaView gscreen].height - y - h, w, h);
-        [cocoaView setNeedsDisplayInRect:rect];
+        [cocoaView setNeedsDisplay:YES];
     });
 }
 
